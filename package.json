@@ -1,0 +1,43 @@
+{
+  "name": "neuroforge-ai",
+  "displayName": "NeuroForge AI",
+  "description": "Inline code intelligence, weakness detection, and skill insights powered by NeuroForge backend.",
+  "version": "0.0.1",
+  "publisher": "neuroforge",
+  "author": "Jibin Jose",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:neuroforge.analyzeFile",
+    "onCommand:neuroforge.analyzeWorkspace"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "neuroforge.analyzeFile",
+        "title": "NeuroForge: Analyze Current File"
+      },
+      {
+        "command": "neuroforge.analyzeWorkspace",
+        "title": "NeuroForge: Analyze Full Workspace"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "lint": "echo \"No lint configured\"",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.17",
+    "@types/vscode": "^1.85.0",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3",
+    "vsce": "^2.15.0"
+  }
+}
