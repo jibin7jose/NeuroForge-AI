@@ -13,7 +13,12 @@
   ],
   "activationEvents": [
     "onCommand:neuroforge.analyzeFile",
-    "onCommand:neuroforge.analyzeWorkspace"
+    "onCommand:neuroforge.analyzeWorkspace",
+    "onCommand:neuroforge.applyFix",
+    "onCommand:neuroforge.explainCode",
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:python"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -25,8 +30,25 @@
       {
         "command": "neuroforge.analyzeWorkspace",
         "title": "NeuroForge: Analyze Full Workspace"
+      },
+      {
+        "command": "neuroforge.applyFix",
+        "title": "NeuroForge: Apply Neural Patch"
+      },
+      {
+        "command": "neuroforge.explainCode",
+        "title": "NeuroForge: Explain this Code"
       }
-    ]
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "neuroforge.explainCode",
+          "group": "navigation",
+          "when": "editorHasSelection"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "tsc -p .",
