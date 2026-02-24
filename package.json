@@ -12,10 +12,6 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:neuroforge.analyzeFile",
-    "onCommand:neuroforge.analyzeWorkspace",
-    "onCommand:neuroforge.applyFix",
-    "onCommand:neuroforge.explainCode",
     "onLanguage:javascript",
     "onLanguage:typescript",
     "onLanguage:python"
@@ -38,6 +34,30 @@
       {
         "command": "neuroforge.explainCode",
         "title": "NeuroForge: Explain this Code"
+      },
+      {
+        "command": "neuroforge.showNeuralDNA",
+        "title": "NeuroForge: Show my Coding DNA"
+      },
+      {
+        "command": "neuroforge.interviewMode",
+        "title": "NeuroForge: Elite Interview Mode"
+      },
+      {
+        "command": "neuroforge.analyzeWorkspace",
+        "title": "NeuroForge: Analyze Workspace Health"
+      },
+      {
+        "command": "neuroforge.showHeatmap",
+        "title": "NeuroForge: Show Complexity Heatmap"
+      },
+      {
+        "command": "neuroforge.generateTests",
+        "title": "NeuroForge: Generate Unit Tests"
+      },
+      {
+        "command": "neuroforge.generateDocs",
+        "title": "NeuroForge: Inject Neural Documentation"
       }
     ],
     "menus": {
@@ -46,8 +66,58 @@
           "command": "neuroforge.explainCode",
           "group": "navigation",
           "when": "editorHasSelection"
+        },
+        {
+          "command": "neuroforge.showNeuralDNA",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.generateTests",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.generateDocs",
+          "group": "navigation",
+          "when": "editorTextFocus"
         }
       ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "neuroforge-explorer",
+          "title": "NeuroForge",
+          "icon": "media/brain.svg"
+        }
+      ]
+    },
+    "views": {
+      "neuroforge-explorer": [
+        {
+          "type": "webview",
+          "id": "neuroforge.sidebar",
+          "name": "Neural Intelligence",
+          "icon": "media/brain.svg"
+        },
+        {
+          "type": "webview",
+          "id": "neuroforge.chat",
+          "name": "NeuroForge Copilot",
+          "icon": "media/brain.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "NeuroForge",
+      "properties": {
+        "neuroforge.aiEngineUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "description": "Base URL for the NeuroForge AI Engine (without trailing slash)."
+        }
+      }
     }
   },
   "scripts": {
