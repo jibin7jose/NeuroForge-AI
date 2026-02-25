@@ -8,8 +8,26 @@ export class FastRefactorActionEngine implements ActionEngine {
             return undefined;
         }
 
-        // Placeholder: a safe no-op until AI patch generation is wired.
-        // Keeping this method explicit now prevents direct document writes later.
-        return undefined;
+        if (!this.supportsOrganizeImports(document.languageId)) {
+            return undefined;
+        }
+
+        const edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>(
+            'vscode.executeOrganizeImports',
+            document.uri
+        );
+
+        if (!edit || edit.size === 0) {
+            return undefined;
+        }
+
+        return edit;
+    }
+
+    private supportsOrganizeImports(languageId: string): boolean {
+        return languageId === 'typescript'
+            || languageId === 'typescriptreact'
+            || languageId === 'javascript'
+            || languageId === 'javascriptreact';
     }
 }

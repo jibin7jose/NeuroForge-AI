@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const fastRefactorActionEngine_1 = require("./actions/fastRefactorActionEngine");
 const riskIntelligenceFeature_1 = require("./features/riskIntelligenceFeature");
 const DEFAULT_AI_ENGINE_URL = 'http://127.0.0.1:8000';
 function getAiEngineUrl() {
@@ -411,6 +412,7 @@ async function activate(context) {
     const diagnosticCollection = vscode.languages.createDiagnosticCollection('neuroforge');
     const lensProvider = new NeuralCodeLensProvider();
     const riskIntelligence = new riskIntelligenceFeature_1.RiskIntelligenceFeature();
+    const fastRefactorEngine = new fastRefactorActionEngine_1.FastRefactorActionEngine();
     const currentDiagnostics = [];
     // --- DECORATION STYLES ---
     const criticalSecurityDecoration = vscode.window.createTextEditorDecorationType({
@@ -676,6 +678,26 @@ async function activate(context) {
                 a.isPreferred = true;
                 return a;
             });
+        }
+    });
+    // --- COMMAND: Fast Refactor ---
+    const fastRefactorDisposable = vscode.commands.registerCommand('neuroforge.fastRefactor', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a file to run a fast refactor.');
+            return;
+        }
+        output.appendLine(`[FastRefactor] Running on ${editor.document.fileName}`);
+        const edit = await fastRefactorEngine.proposeRefactor(editor.document);
+        if (!edit) {
+            output.appendLine('[FastRefactor] No changes produced.');
+            vscode.window.showInformationMessage('NeuroForge: No fast refactor available for this file.');
+            return;
+        }
+        const applied = await vscode.workspace.applyEdit(edit);
+        if (applied) {
+            output.appendLine('[FastRefactor] Workspace edit applied.');
+            vscode.window.showInformationMessage('NeuroForge: Fast refactor applied.');
         }
     });
     // --- COMMAND: Explain Code ---
@@ -1093,7 +1115,7 @@ async function activate(context) {
             return [];
         }
     });
-    context.subscriptions.push(analyzeDisposable, explainDisposable, dnaDisposable, applyFixDisposable, codeActionProvider, vscode.languages.registerCodeLensProvider(['javascript', 'typescript', 'python'], lensProvider), analyzeBtn, timeTrackerBar, typingDisposable, autoAnalyzeDisposable, interviewDisposable, workspaceDisposable, heatmapDisposable, generateTestsDisposable, generateDocsDisposable, autocompleteProvider);
+    context.subscriptions.push(analyzeDisposable, explainDisposable, dnaDisposable, applyFixDisposable, fastRefactorDisposable, codeActionProvider, vscode.languages.registerCodeLensProvider(['javascript', 'typescript', 'python'], lensProvider), analyzeBtn, timeTrackerBar, typingDisposable, autoAnalyzeDisposable, interviewDisposable, workspaceDisposable, heatmapDisposable, generateTestsDisposable, generateDocsDisposable, autocompleteProvider);
     context.subscriptions.push(vscode.commands.registerCommand('neuroforge.healthCheck', checkHealth));
 }
 function deactivate() { }

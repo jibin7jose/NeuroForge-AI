@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
+import { FastRefactorActionEngine } from './actions/fastRefactorActionEngine';
 import { RiskIntelligenceFeature } from './features/riskIntelligenceFeature';
 
 const DEFAULT_AI_ENGINE_URL = 'http://127.0.0.1:8000';
@@ -12,6 +14,123 @@ function getAiEngineUrl(): string {
 function toErrorMessage(err: unknown): string {
     if (err instanceof Error) return err.message;
     return String(err);
+}
+
+type RetryOptions = {
+    timeoutMs?: number;
+    retries?: number;
+    retryDelayMs?: number;
+};
+
+type EngineHealthCache = {
+    ok: boolean;
+    checkedAt: number;
+    message?: string;
+};
+
+function getFetch(): typeof fetch {
+    if (typeof (globalThis as any).fetch === 'function') return (globalThis as any).fetch as typeof fetch;
+    throw new Error('Fetch API not available in this environment.');
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryableError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    const msg = err.message.toLowerCase();
+    return err.name === 'AbortError'
+        || msg.includes('fetch')
+        || msg.includes('network')
+        || msg.includes('timeout')
+        || msg.includes('econn')
+        || msg.includes('enotfound')
+        || msg.includes('eai_again');
+}
+
+async function fetchWithRetry(
+    url: string,
+    options: RequestInit = {},
+    retryOptions: RetryOptions = {}
+): Promise<Response> {
+    const fetchFn = getFetch();
+    const canRetryBody = options.body == null || typeof options.body === 'string';
+    const retries = canRetryBody ? (retryOptions.retries ?? 1) : 0;
+    const timeoutMs = retryOptions.timeoutMs ?? 10000;
+    const retryDelayMs = retryOptions.retryDelayMs ?? 300;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const res = await fetchFn(url, { ...options, signal: controller.signal });
+            clearTimeout(timeout);
+            if (res.ok) return res;
+            if (res.status >= 500 && attempt < retries) {
+                await sleep(retryDelayMs * (attempt + 1));
+                continue;
+            }
+            return res;
+        } catch (err) {
+            clearTimeout(timeout);
+            if (attempt < retries && isRetryableError(err)) {
+                await sleep(retryDelayMs * (attempt + 1));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw new Error('Request failed after retries.');
+}
+
+const HEALTH_OK_CACHE_MS = 15000;
+const HEALTH_FAIL_CACHE_MS = 5000;
+let healthCache: EngineHealthCache | null = null;
+let engineStatusBar: vscode.StatusBarItem | null = null;
+
+function updateEngineStatus(online: boolean, detail?: string): void {
+    if (!engineStatusBar) return;
+    if (online) {
+        engineStatusBar.text = `$(debug-connect) NF Engine: online`;
+        engineStatusBar.tooltip = detail ?? 'NeuroForge AI engine is reachable.';
+        return;
+    }
+    engineStatusBar.text = `$(debug-disconnect) NF Engine: offline`;
+    engineStatusBar.tooltip = detail ?? 'NeuroForge AI engine is unreachable.';
+}
+
+function isEngineUnavailableCached(): boolean {
+    if (!healthCache || healthCache.ok) return false;
+    return Date.now() - healthCache.checkedAt < HEALTH_FAIL_CACHE_MS;
+}
+
+async function ensureEngineReachable(engineUrl: string, output?: vscode.OutputChannel): Promise<boolean> {
+    const now = Date.now();
+    if (healthCache) {
+        const ttl = healthCache.ok ? HEALTH_OK_CACHE_MS : HEALTH_FAIL_CACHE_MS;
+        if (now - healthCache.checkedAt < ttl) {
+            return healthCache.ok;
+        }
+    }
+
+    try {
+        const res = await fetchWithRetry(`${engineUrl}/health`, {}, { timeoutMs: 2500, retries: 0 });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        healthCache = { ok: true, checkedAt: now };
+        updateEngineStatus(true);
+        return true;
+    } catch (err) {
+        const msg = toErrorMessage(err);
+        healthCache = { ok: false, checkedAt: now, message: msg };
+        updateEngineStatus(false, msg);
+        if (output) {
+            output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/health`);
+            output.appendLine(`[ERROR] ${msg}`);
+        }
+        vscode.window.showErrorMessage(`NeuroForge engine unreachable at ${engineUrl}: ${msg}`);
+        return false;
+    }
 }
 
 function getInterviewLoadingHtml(): string {
@@ -66,7 +185,7 @@ function getInterviewHtml(questions: string[]): string {
         .score-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, #2f81f7, #3fb950); transition: width 1s; }
     </style></head>
     <body>
-        <h1>⚡ NeuroForge Elite Interview Mode</h1>
+        <h1>NeuroForge Elite Interview Mode</h1>
         <p class="header-sub">Questions are generated from a deep analysis of your code's architecture, security posture, and behavioral patterns. Answer as you would in a Staff-level engineering interview.</p>
         ${questionItems}
         <script>
@@ -89,7 +208,7 @@ function getInterviewHtml(questions: string[]): string {
                     const btns = document.querySelectorAll('.submit-btn');
                     btns.forEach((btn, idx) => {
                         if (btn.disabled && btn.textContent === 'Evaluating...') {
-                            btn.textContent = '✓ Evaluated';
+                            btn.textContent = 'Evaluated';
                             const fbBox = document.getElementById('fb' + idx);
                             const statusKey = (fb.status || 'Strong').split(' ')[0];
                             fbBox.innerHTML = \`
@@ -105,6 +224,13 @@ function getInterviewHtml(questions: string[]): string {
             });
         </script>
     </body></html>`;
+}
+
+function supportsFastRefactor(languageId: string): boolean {
+    return languageId === 'typescript'
+        || languageId === 'typescriptreact'
+        || languageId === 'javascript'
+        || languageId === 'javascriptreact';
 }
 
 class NeuralCodeLensProvider implements vscode.CodeLensProvider {
@@ -141,7 +267,7 @@ class NeuralCodeLensProvider implements vscode.CodeLensProvider {
         }));
 
         if (this.lastScore !== null) {
-            const color = this.lastScore >= 80 ? '🟢' : this.lastScore >= 50 ? '🟡' : '🔴';
+            const color = this.lastScore >= 80 ? '[HIGH]' : this.lastScore >= 50 ? '[MED]' : '[LOW]';
             lenses.push(new vscode.CodeLens(topRange, {
                 title: `${color} Score: ${this.lastScore}%`,
                 command: ""
@@ -241,7 +367,7 @@ class NeuralSidebarProvider implements vscode.WebviewViewProvider {
                 </div>
 
                 <div class="card">
-                    <div class="label">Hotspots — ${weaknesses.length} issue${weaknesses.length !== 1 ? 's' : ''}</div>
+                    <div class="label">Hotspots - ${weaknesses.length} issue${weaknesses.length !== 1 ? 's' : ''}</div>
                     ${issuesHtml || '<div style="color:#8b949e;font-size:11px;margin-top:6px;">No critical issues detected</div>'}
                     ${weaknesses.length > 4 ? `<div style="font-size:10px;color:#8b949e;margin-top:6px;">+ ${weaknesses.length - 4} more</div>` : ''}
                 </div>
@@ -290,19 +416,22 @@ class NeuralChatProvider implements vscode.WebviewViewProvider {
                 }
                 const code = editor.document.getText();
                 const language = editor.document.languageId;
+                const engineUrl = getAiEngineUrl();
+                const reachable = await ensureEngineReachable(engineUrl);
+                if (!reachable) {
+                    this._view?.webview.postMessage({ command: 'receiveMessage', text: 'NeuroForge engine unreachable. Start the AI engine and try again.', sender: 'ai' });
+                    return;
+                }
 
                 // Show loading
                 this._view?.webview.postMessage({ command: 'loading' });
 
                 try {
-                    const fetchFn = (typeof (globalThis as any).fetch === 'function') ? (globalThis as any).fetch as typeof fetch : null;
-                    if (!fetchFn) throw new Error("Fetch API unavailable.");
-
-                    const res = await fetchFn(`${getAiEngineUrl()}/chat`, {
+                    const res = await fetchWithRetry(`${engineUrl}/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ message: data.text, code, language }),
-                    });
+                    }, { timeoutMs: 12000, retries: 1 });
                     const responseData: any = await res.json();
 
                     if (responseData.status === 'success') {
@@ -404,6 +533,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const diagnosticCollection = vscode.languages.createDiagnosticCollection('neuroforge');
     const lensProvider = new NeuralCodeLensProvider();
     const riskIntelligence = new RiskIntelligenceFeature();
+    const fastRefactorEngine = new FastRefactorActionEngine();
 
     const currentDiagnostics: vscode.Diagnostic[] = [];
 
@@ -415,7 +545,7 @@ export async function activate(context: vscode.ExtensionContext) {
         overviewRulerColor: 'rgba(218, 54, 51, 0.8)',
         overviewRulerLane: vscode.OverviewRulerLane.Right,
         after: {
-            contentText: ' ⚠️ NEURAL SECURITY VULNERABILITY',
+            contentText: ' WARNING: NEURAL SECURITY VULNERABILITY',
             color: 'rgba(218, 54, 51, 0.8)',
             margin: '0 0 0 10px',
             fontStyle: 'italic',
@@ -440,6 +570,18 @@ export async function activate(context: vscode.ExtensionContext) {
 
     riskIntelligence.register(context);
     context.subscriptions.push(riskIntelligence);
+
+    // --- Engine Status Bar ---
+    engineStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 999);
+    engineStatusBar.text = '$(debug-disconnect) NF Engine: unknown';
+    engineStatusBar.tooltip = 'NeuroForge AI engine status';
+    engineStatusBar.command = 'neuroforge.healthCheck';
+    engineStatusBar.show();
+    void ensureEngineReachable(getAiEngineUrl(), output);
+    const engineStatusTimer = setInterval(() => {
+        void ensureEngineReachable(getAiEngineUrl(), output);
+    }, 60000);
+    context.subscriptions.push(new vscode.Disposable(() => clearInterval(engineStatusTimer)));
 
     // --- Status Bar: NeuroForge Quick Access ---
     const analyzeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
@@ -474,32 +616,54 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     }, 1000);
 
-    const getFetch = () => {
-        if (typeof (globalThis as any).fetch === 'function') return (globalThis as any).fetch as typeof fetch;
-        throw new Error('Fetch API not available in this environment.');
-    };
-
     const checkHealth = async () => {
-        const fetchFn = getFetch();
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 4000);
         const engineUrl = getAiEngineUrl();
         try {
-            const res = await fetchFn(`${engineUrl}/health`, { signal: controller.signal });
-            clearTimeout(timeout);
+            const res = await fetchWithRetry(
+                `${engineUrl}/health`,
+                {},
+                { timeoutMs: 4000, retries: 0 }
+            );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data: any = await res.json();
-            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} · ML: ${data.ml_available ? 'on' : 'off'} · Uptime: ${data.uptime_seconds ?? 0}s`);
+            updateEngineStatus(true, `ML: ${data.ml_available ? 'on' : 'off'} | Uptime: ${data.uptime_seconds ?? 0}s`);
+            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} | ML: ${data.ml_available ? 'on' : 'off'} | Uptime: ${data.uptime_seconds ?? 0}s`);
         } catch (e: any) {
             const msg = toErrorMessage(e);
             output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/health`);
             output.appendLine(`[ERROR] ${msg}`);
+            updateEngineStatus(false, msg);
             vscode.window.showErrorMessage(`NeuroForge engine unreachable at ${engineUrl}: ${msg}`);
         }
     };
 
+    const startEngineDisposable = vscode.commands.registerCommand('neuroforge.startEngine', async () => {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage('Open a workspace to start the AI engine.');
+            return;
+        }
+
+        const enginePath = path.join(workspaceFolder.uri.fsPath, 'ai-engine');
+        let cwd = workspaceFolder.uri.fsPath;
+        try {
+            await vscode.workspace.fs.stat(vscode.Uri.file(enginePath));
+            cwd = enginePath;
+        } catch {
+            // Fall back to workspace root if ai-engine folder is missing.
+        }
+
+        const terminal = vscode.window.createTerminal({ name: 'NeuroForge AI Engine', cwd });
+        terminal.show(true);
+        terminal.sendText('python main.py', true);
+        vscode.window.showInformationMessage(`Starting NeuroForge AI Engine in ${cwd}`);
+    });
+
     // --- Auto-Analyze on Save ---
     const autoAnalyzeDisposable = vscode.workspace.onDidSaveTextDocument((doc) => {
+        if (doc.uri.scheme !== 'file') {
+            return;
+        }
         const supportedLangs = ['python', 'javascript', 'typescript', 'javascriptreact', 'typescriptreact'];
         if (supportedLangs.includes(doc.languageId)) {
             const editor = vscode.window.activeTextEditor;
@@ -515,23 +679,29 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!editor) return;
 
         const doc = editor.document;
+        if (doc.uri.scheme !== 'file') {
+            vscode.window.showWarningMessage('NeuroForge analysis is only available for saved files.');
+            return;
+        }
         const code = doc.getText();
         if (!code.trim()) return;
 
         const language = doc.languageId;
         const status = vscode.window.setStatusBarMessage('$(sync~spin) NeuroForge deep-learning analysis in progress...');
-        const fetchFn = getFetch();
         const engineUrl = getAiEngineUrl();
 
         try {
+            const reachable = await ensureEngineReachable(engineUrl, output);
+            if (!reachable) return;
+
             output.appendLine(`NeuroForge Request: Analyzing ${doc.fileName}...`);
             output.show(true);
 
-            const res = await fetchFn(`${engineUrl}/analyze`, {
+            const res = await fetchWithRetry(`${engineUrl}/analyze`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ code, language, history: [] }),
-            });
+            }, { timeoutMs: 12000, retries: 1 });
 
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -631,7 +801,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const doc = editor.document;
         const code = doc.getText();
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
 
         // Identify strategy
         let strategyId = 'refactor-entropy-reduction';
@@ -645,11 +817,11 @@ export async function activate(context: vscode.ExtensionContext) {
         }, async () => {
             try {
                 // Step 1: Get preview diff
-                const previewRes = await fetchFn(`${getAiEngineUrl()}/refactor/preview`, {
+                const previewRes = await fetchWithRetry(`${engineUrl}/refactor/preview`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code, language: doc.languageId, strategy_id: strategyId }),
-                });
+                }, { timeoutMs: 12000, retries: 1 });
                 const preview: any = await previewRes.json();
 
                 if (preview.status === 'no_change') {
@@ -674,18 +846,18 @@ export async function activate(context: vscode.ExtensionContext) {
                 if (confirm !== 'Apply Patch') return;
 
                 // Step 3: Apply the actual patch
-                const res = await fetchFn(`${getAiEngineUrl()}/refactor/apply`, {
+                const res = await fetchWithRetry(`${engineUrl}/refactor/apply`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code, language: doc.languageId, strategy_id: strategyId }),
-                });
+                }, { timeoutMs: 12000, retries: 1 });
 
                 const result: any = await res.json();
                 if (result.status === 'success' && result.refactored) {
                     const edit = new vscode.WorkspaceEdit();
                     edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), result.refactored);
                     await vscode.workspace.applyEdit(edit);
-                    vscode.window.showInformationMessage(`✓ Neural Patch applied — ${linesChanged} lines transformed.`);
+                    vscode.window.showInformationMessage(`Neural Patch applied - ${linesChanged} lines transformed.`);
                     vscode.commands.executeCommand('neuroforge.analyzeFile');
                 } else {
                     vscode.window.showErrorMessage(`Patch failed: ${result.message || 'Unknown error'}`);
@@ -700,7 +872,7 @@ export async function activate(context: vscode.ExtensionContext) {
         ['javascript', 'typescript', 'python'],
         {
             provideCodeActions(document, range, context) {
-                return context.diagnostics
+                const actions = context.diagnostics
                     .filter(d => d.source === 'NeuroForge')
                     .map(d => {
                         const a = new vscode.CodeAction('Resolve with NeuroForge AI', vscode.CodeActionKind.QuickFix);
@@ -709,9 +881,48 @@ export async function activate(context: vscode.ExtensionContext) {
                         a.isPreferred = true;
                         return a;
                     });
+
+                if (context.diagnostics.length > 0 && supportsFastRefactor(document.languageId)) {
+                    const fastRefactor = new vscode.CodeAction(
+                        'NeuroForge: Fast Refactor (Organize Imports)',
+                        vscode.CodeActionKind.QuickFix
+                    );
+                    fastRefactor.command = { command: 'neuroforge.fastRefactor', title: 'Fast Refactor' };
+                    actions.push(fastRefactor);
+                }
+
+                return actions;
             }
         }
     );
+
+    // --- COMMAND: Fast Refactor ---
+    const fastRefactorDisposable = vscode.commands.registerCommand('neuroforge.fastRefactor', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a file to run a fast refactor.');
+            return;
+        }
+
+        output.appendLine(`[FastRefactor] Running on ${editor.document.fileName}`);
+        const edit = await fastRefactorEngine.proposeRefactor(editor.document);
+        if (!edit) {
+            output.appendLine('[FastRefactor] No changes produced.');
+            vscode.window.showInformationMessage('NeuroForge: No fast refactor available for this file.');
+            return;
+        }
+
+        const applied = await vscode.workspace.applyEdit(edit);
+        if (applied) {
+            output.appendLine('[FastRefactor] Workspace edit applied.');
+            vscode.window.showInformationMessage('NeuroForge: Fast refactor applied.');
+        }
+    });
+
+    const showLogsDisposable = vscode.commands.registerCommand('neuroforge.showLogs', () => {
+        output.show(true);
+        vscode.window.showInformationMessage('NeuroForge logs are in the Output panel (channel: NeuroForge).');
+    });
 
     // --- COMMAND: Explain Code ---
     const explainDisposable = vscode.commands.registerCommand('neuroforge.explainCode', async () => {
@@ -720,7 +931,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const selection = editor.selection;
         const code = selection.isEmpty ? editor.document.getText() : editor.document.getText(selection);
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
 
         const panel = vscode.window.createWebviewPanel(
             'neuroforgeExplain',
@@ -736,11 +949,11 @@ export async function activate(context: vscode.ExtensionContext) {
         `;
 
         try {
-            const res = await fetchFn(`${getAiEngineUrl()}/explain`, {
+            const res = await fetchWithRetry(`${engineUrl}/explain`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ code, language: editor.document.languageId }),
-            });
+            }, { timeoutMs: 12000, retries: 1 });
 
             const data: any = await res.json();
             if (data.status === 'success') {
@@ -772,7 +985,9 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!editor) return;
 
         const code = editor.document.getText();
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
 
         const panel = vscode.window.createWebviewPanel(
             'neuroforgeDNA',
@@ -782,11 +997,11 @@ export async function activate(context: vscode.ExtensionContext) {
         );
 
         try {
-            const res = await fetchFn(`${getAiEngineUrl()}/analyze/dna`, {
+            const res = await fetchWithRetry(`${engineUrl}/analyze/dna`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ code, language: editor.document.languageId }),
-            });
+            }, { timeoutMs: 12000, retries: 1 });
 
             const data: any = await res.json();
             if (data.status === 'success') {
@@ -872,7 +1087,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const code = editor.document.getText();
         const language = editor.document.languageId;
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
 
         const panel = vscode.window.createWebviewPanel(
             'neuroforgeInterview',
@@ -885,11 +1102,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
         try {
             // Run full analysis to get context
-            const analysisRes = await fetchFn(`${getAiEngineUrl()}/analyze`, {
+            const analysisRes = await fetchWithRetry(`${engineUrl}/analyze`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ code, language, history: [] }),
-            });
+            }, { timeoutMs: 15000, retries: 1 });
             const analysisData: any = await analysisRes.json();
             const questions: string[] = analysisData?.interview_readiness?.suggested_questions || [
                 'How would you improve the architecture of this code?',
@@ -903,11 +1120,11 @@ export async function activate(context: vscode.ExtensionContext) {
                 if (msg.command === 'submitAnswer') {
                     const { question, answer } = msg;
                     try {
-                        const fbRes = await fetchFn(`${getAiEngineUrl()}/interview/feedback`, {
+                        const fbRes = await fetchWithRetry(`${engineUrl}/interview/feedback`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ question, answer }),
-                        });
+                        }, { timeoutMs: 12000, retries: 1 });
                         const fb: any = await fbRes.json();
                         panel.webview.postMessage({ command: 'feedback', data: fb });
                     } catch (e) {
@@ -926,9 +1143,12 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.window.showWarningMessage('No workspace open.');
             return;
         }
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
+
         output.show(true);
-        output.appendLine('\n━━━ NeuroForge Workspace Scan ━━━');
+        output.appendLine('\n=== NeuroForge Workspace Scan ===');
 
         const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py}', '**/node_modules/**', 40);
         const fileResults: { path: string; score: number; issues: number }[] = [];
@@ -946,11 +1166,11 @@ export async function activate(context: vscode.ExtensionContext) {
                     const code = doc.getText();
                     if (!code.trim() || code.length > 60000) continue;
 
-                    const res = await fetchFn(`${getAiEngineUrl()}/analyze`, {
+                    const res = await fetchWithRetry(`${engineUrl}/analyze`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ code, language: doc.languageId, history: [] }),
-                    });
+                    }, { timeoutMs: 12000, retries: 1 });
                     const data: any = await res.json();
                     const weaknesses: any[] = data.weaknesses || [];
                     const score: number = data.metrics?.clean_code_score ?? 100;
@@ -969,9 +1189,9 @@ export async function activate(context: vscode.ExtensionContext) {
                             return d;
                         });
                         diagnosticCollection.set(file, diags);
-                        output.appendLine(`  [!] ${file.path.split('/').pop()} — Score: ${score}%  Issues: ${weaknesses.length}`);
+                        output.appendLine(`  [!] ${file.path.split('/').pop()} - Score: ${score}%  Issues: ${weaknesses.length}`);
                     } else {
-                        output.appendLine(`  [✓] ${file.path.split('/').pop()} — Score: ${score}%  Clean`);
+                        output.appendLine(`  [OK] ${file.path.split('/').pop()} - Score: ${score}%  Clean`);
                     }
                 } catch { /* skip file */ }
             }
@@ -982,19 +1202,22 @@ export async function activate(context: vscode.ExtensionContext) {
             : 0;
         const totalIssues = fileResults.reduce((a, b) => a + b.issues, 0);
 
-        output.appendLine(`\n━━━ Workspace Report ━━━`);
+        output.appendLine(`\n=== Workspace Report ===`);
         output.appendLine(`  Files Scanned : ${fileResults.length}`);
         output.appendLine(`  Avg Score     : ${avgScore}%`);
         output.appendLine(`  Total Issues  : ${totalIssues}`);
 
         vscode.window.showInformationMessage(
-            `Workspace scan complete. ${fileResults.length} files — Avg score: ${avgScore}% — ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}.`
+            `Workspace scan complete. ${fileResults.length} files - Avg score: ${avgScore}% - ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}.`
         );
     });
 
     // --- COMMAND: Neural Heatmap ---
     const heatmapDisposable = vscode.commands.registerCommand('neuroforge.showHeatmap', async () => {
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
+
         const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py}', '**/node_modules/**', 30);
 
         const panel = vscode.window.createWebviewPanel(
@@ -1004,7 +1227,7 @@ export async function activate(context: vscode.ExtensionContext) {
             { enableScripts: true }
         );
 
-        panel.webview.html = `<body style="background:#02040a;color:#e6edf3;padding:30px;font-family:sans-serif;"><p>🔥 Scanning workspace for complexity hotspots...</p></body>`;
+        panel.webview.html = `<body style="background:#02040a;color:#e6edf3;padding:30px;font-family:sans-serif;"><p>Scanning workspace for complexity hotspots...</p></body>`;
 
         const fileData: { name: string; score: number; issues: number; complexity: number }[] = [];
 
@@ -1014,11 +1237,11 @@ export async function activate(context: vscode.ExtensionContext) {
                 const code = doc.getText();
                 if (!code.trim() || code.length > 50000) continue;
 
-                const res = await fetchFn(`${getAiEngineUrl()}/analyze`, {
+                const res = await fetchWithRetry(`${engineUrl}/analyze`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code, language: doc.languageId, history: [] }),
-                });
+                }, { timeoutMs: 12000, retries: 1 });
                 const data: any = await res.json();
                 fileData.push({
                     name: file.path.split('/').pop() || file.path,
@@ -1059,7 +1282,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 .empty { color: #8b949e; font-size: 14px; }
             </style></head>
             <body>
-                <h1>🔥 Neural Complexity Heatmap</h1>
+                <h1>Neural Complexity Heatmap</h1>
                 <div class="legend">
                     <span>High Quality</span>
                     <div class="legend-bar"></div>
@@ -1079,7 +1302,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const doc = editor.document;
         const code = doc.getText();
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
 
         vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
@@ -1087,11 +1312,11 @@ export async function activate(context: vscode.ExtensionContext) {
             cancellable: false
         }, async () => {
             try {
-                const res = await fetchFn(`${getAiEngineUrl()}/generate/tests`, {
+                const res = await fetchWithRetry(`${engineUrl}/generate/tests`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code, language: doc.languageId, history: [] }),
-                });
+                }, { timeoutMs: 15000, retries: 1 });
                 const data: any = await res.json();
 
                 if (data.status === 'success' && data.tests) {
@@ -1114,7 +1339,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const doc = editor.document;
         const code = doc.getText();
-        const fetchFn = getFetch();
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
 
         vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
@@ -1122,11 +1349,11 @@ export async function activate(context: vscode.ExtensionContext) {
             cancellable: false
         }, async () => {
             try {
-                const res = await fetchFn(`${getAiEngineUrl()}/generate/docs`, {
+                const res = await fetchWithRetry(`${engineUrl}/generate/docs`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code, language: doc.languageId, history: [] }),
-                });
+                }, { timeoutMs: 15000, retries: 1 });
                 const data: any = await res.json();
 
                 if (data.status === 'success' && data.documented_code) {
@@ -1156,10 +1383,10 @@ export async function activate(context: vscode.ExtensionContext) {
                 const suffix = document.getText(suffixRange);
 
                 if (prefix.trim().length < 5) return [];
+                if (isEngineUnavailableCached()) return [];
 
                 try {
-                    const fetchFn = getFetch();
-                    const res = await fetchFn(`${getAiEngineUrl()}/autocomplete`, {
+                    const res = await fetchWithRetry(`${getAiEngineUrl()}/autocomplete`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1167,7 +1394,7 @@ export async function activate(context: vscode.ExtensionContext) {
                             suffix,
                             language: document.languageId
                         }),
-                    });
+                    }, { timeoutMs: 5000, retries: 0 });
 
                     if (token.isCancellationRequested) return [];
 
@@ -1188,9 +1415,13 @@ export async function activate(context: vscode.ExtensionContext) {
         explainDisposable,
         dnaDisposable,
         applyFixDisposable,
+        fastRefactorDisposable,
+        showLogsDisposable,
+        startEngineDisposable,
         codeActionProvider,
         vscode.languages.registerCodeLensProvider(['javascript', 'typescript', 'python'], lensProvider),
         analyzeBtn,
+        engineStatusBar,
         timeTrackerBar,
         typingDisposable,
         autoAnalyzeDisposable,

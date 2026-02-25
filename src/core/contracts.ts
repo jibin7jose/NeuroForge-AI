@@ -78,7 +78,12 @@ export interface AnalysisSnapshot {
     readonly securitySignals: readonly SecuritySignal[];
     readonly performanceSignals: readonly PerformanceSignal[];
     readonly score?: NeuroScoreResult;
+    readonly coverageStatus?: CoverageStatus;
+    readonly coverageSource?: string;
+    readonly coverageError?: string;
 }
+
+export type CoverageStatus = 'ok' | 'missing' | 'error';
 
 export interface WorkspaceAnalyzer {
     analyze(input: AnalysisInput): Promise<AnalysisSnapshot>;

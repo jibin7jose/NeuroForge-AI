@@ -44,10 +44,6 @@
         "title": "NeuroForge: Elite Interview Mode"
       },
       {
-        "command": "neuroforge.analyzeWorkspace",
-        "title": "NeuroForge: Analyze Workspace Health"
-      },
-      {
         "command": "neuroforge.showHeatmap",
         "title": "NeuroForge: Show Complexity Heatmap"
       },
@@ -66,6 +62,22 @@
       {
         "command": "neuroforge.toggleRiskHeatmap",
         "title": "NeuroForge: Toggle Risk Heatmap"
+      },
+      {
+        "command": "neuroforge.selectCoverageFile",
+        "title": "NeuroForge: Select Coverage File"
+      },
+      {
+        "command": "neuroforge.fastRefactor",
+        "title": "NeuroForge: Fast Refactor (Organize Imports)"
+      },
+      {
+        "command": "neuroforge.showLogs",
+        "title": "NeuroForge: Show Logs"
+      },
+      {
+        "command": "neuroforge.startEngine",
+        "title": "NeuroForge: Start AI Engine"
       }
     ],
     "menus": {
@@ -74,6 +86,11 @@
           "command": "neuroforge.explainCode",
           "group": "navigation",
           "when": "editorHasSelection"
+        },
+        {
+          "command": "neuroforge.fastRefactor",
+          "group": "navigation",
+          "when": "editorTextFocus"
         },
         {
           "command": "neuroforge.showNeuralDNA",
@@ -124,6 +141,11 @@
           "type": "string",
           "default": "http://127.0.0.1:8000",
           "description": "Base URL for the NeuroForge AI Engine (without trailing slash)."
+        },
+        "neuroforge.coverageFile": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a coverage JSON file (e.g., coverage-final.json)."
         }
       }
     }
