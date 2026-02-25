@@ -58,6 +58,14 @@
       {
         "command": "neuroforge.generateDocs",
         "title": "NeuroForge: Inject Neural Documentation"
+      },
+      {
+        "command": "neuroforge.refreshRiskHeatmap",
+        "title": "NeuroForge: Refresh Risk Heatmap"
+      },
+      {
+        "command": "neuroforge.toggleRiskHeatmap",
+        "title": "NeuroForge: Toggle Risk Heatmap"
       }
     ],
     "menus": {

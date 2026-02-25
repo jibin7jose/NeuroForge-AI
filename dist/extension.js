@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const riskIntelligenceFeature_1 = require("./features/riskIntelligenceFeature");
 const DEFAULT_AI_ENGINE_URL = 'http://127.0.0.1:8000';
 function getAiEngineUrl() {
     const configured = vscode.workspace.getConfiguration('neuroforge').get('aiEngineUrl');
@@ -97,7 +98,7 @@ function getInterviewHtml(questions) {
         .score-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, #2f81f7, #3fb950); transition: width 1s; }
     </style></head>
     <body>
-        <h1>âš¡ NeuroForge Elite Interview Mode</h1>
+        <h1>⚡ NeuroForge Elite Interview Mode</h1>
         <p class="header-sub">Questions are generated from a deep analysis of your code's architecture, security posture, and behavioral patterns. Answer as you would in a Staff-level engineering interview.</p>
         ${questionItems}
         <script>
@@ -120,7 +121,7 @@ function getInterviewHtml(questions) {
                     const btns = document.querySelectorAll('.submit-btn');
                     btns.forEach((btn, idx) => {
                         if (btn.disabled && btn.textContent === 'Evaluating...') {
-                            btn.textContent = 'âœ“ Evaluated';
+                            btn.textContent = '✓ Evaluated';
                             const fbBox = document.getElementById('fb' + idx);
                             const statusKey = (fb.status || 'Strong').split(' ')[0];
                             fbBox.innerHTML = \`
@@ -166,7 +167,7 @@ class NeuralCodeLensProvider {
             tooltip: "Start an elite AI-powered interview session"
         }));
         if (this.lastScore !== null) {
-            const color = this.lastScore >= 80 ? 'ðŸŸ¢' : this.lastScore >= 50 ? 'ðŸŸ¡' : 'ðŸ”´';
+            const color = this.lastScore >= 80 ? '🟢' : this.lastScore >= 50 ? '🟡' : '🔴';
             lenses.push(new vscode.CodeLens(topRange, {
                 title: `${color} Score: ${this.lastScore}%`,
                 command: ""
@@ -257,7 +258,7 @@ class NeuralSidebarProvider {
                 </div>
 
                 <div class="card">
-                    <div class="label">Hotspots â€” ${weaknesses.length} issue${weaknesses.length !== 1 ? 's' : ''}</div>
+                    <div class="label">Hotspots — ${weaknesses.length} issue${weaknesses.length !== 1 ? 's' : ''}</div>
                     ${issuesHtml || '<div style="color:#8b949e;font-size:11px;margin-top:6px;">No critical issues detected</div>'}
                     ${weaknesses.length > 4 ? `<div style="font-size:10px;color:#8b949e;margin-top:6px;">+ ${weaknesses.length - 4} more</div>` : ''}
                 </div>
@@ -409,10 +410,33 @@ async function activate(context) {
     const output = vscode.window.createOutputChannel('NeuroForge');
     const diagnosticCollection = vscode.languages.createDiagnosticCollection('neuroforge');
     const lensProvider = new NeuralCodeLensProvider();
+    const riskIntelligence = new riskIntelligenceFeature_1.RiskIntelligenceFeature();
+    const currentDiagnostics = [];
+    // --- DECORATION STYLES ---
+    const criticalSecurityDecoration = vscode.window.createTextEditorDecorationType({
+        backgroundColor: 'rgba(218, 54, 51, 0.2)', // Glowing red background
+        isWholeLine: true,
+        border: '1px solid rgba(218, 54, 51, 0.6)',
+        overviewRulerColor: 'rgba(218, 54, 51, 0.8)',
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+        after: {
+            contentText: ' ⚠️ NEURAL SECURITY VULNERABILITY',
+            color: 'rgba(218, 54, 51, 0.8)',
+            margin: '0 0 0 10px',
+            fontStyle: 'italic',
+            fontWeight: 'bold'
+        }
+    });
+    const highSecurityDecoration = vscode.window.createTextEditorDecorationType({
+        backgroundColor: 'rgba(227, 179, 65, 0.15)', // Glowing yellow background
+        isWholeLine: true,
+        overviewRulerColor: 'rgba(227, 179, 65, 0.8)',
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+    });
     const sidebarProvider = new NeuralSidebarProvider(context.extensionUri);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(NeuralSidebarProvider.viewType, sidebarProvider));
-    const chatProvider = new NeuralChatProvider(context.extensionUri);
-    context.subscriptions.push(vscode.window.registerWebviewViewProvider(NeuralChatProvider.viewType, chatProvider));
+    riskIntelligence.register(context);
+    context.subscriptions.push(riskIntelligence);
     // --- Status Bar: NeuroForge Quick Access ---
     const analyzeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
     analyzeBtn.text = `$(zap) NeuroForge`;
@@ -460,7 +484,7 @@ async function activate(context) {
             if (!res.ok)
                 throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
-            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} Â· ML: ${data.ml_available ? 'on' : 'off'} Â· Uptime: ${data.uptime_seconds ?? 0}s`);
+            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} · ML: ${data.ml_available ? 'on' : 'off'} · Uptime: ${data.uptime_seconds ?? 0}s`);
         }
         catch (e) {
             const msg = toErrorMessage(e);
@@ -532,6 +556,37 @@ async function activate(context) {
                 diagnostics.push(diag);
             });
             diagnosticCollection.set(doc.uri, diagnostics);
+            // --- Apply Security Decorations ---
+            const secVulnerabilities = data.security?.vulnerabilities || [];
+            if (secVulnerabilities.length > 0 && editor) {
+                const codeLines = code.split('\n');
+                const criticalRanges = [];
+                const highRanges = [];
+                secVulnerabilities.forEach((v) => {
+                    // Primitive matching logic for MVP visual appeal
+                    let matchedLine = 0;
+                    if (v.type.includes('Injection')) {
+                        matchedLine = codeLines.findIndex(l => l.includes('execute') || l.includes('system'));
+                    }
+                    else if (v.type.includes('Key Exposure')) {
+                        matchedLine = codeLines.findIndex(l => l.includes('BEGIN') && l.includes('KEY'));
+                    }
+                    else if (v.type.includes('Leak') || v.type.includes('Secret')) {
+                        matchedLine = codeLines.findIndex(l => l.includes('secret') || l.includes('password') || l.includes('api_key') || l.includes('://'));
+                    }
+                    if (matchedLine !== -1 && matchedLine >= 0) {
+                        const range = doc.lineAt(matchedLine).range;
+                        if (v.severity === 'Critical') {
+                            criticalRanges.push(range);
+                        }
+                        else {
+                            highRanges.push(range);
+                        }
+                    }
+                });
+                editor.setDecorations(criticalSecurityDecoration, criticalRanges);
+                editor.setDecorations(highSecurityDecoration, highRanges);
+            }
             sidebarProvider.updateView(data);
             vscode.window.showInformationMessage(`NeuroForge: ${weaknesses.length} potential issues identified.`);
         }
@@ -598,7 +653,7 @@ async function activate(context) {
                     const edit = new vscode.WorkspaceEdit();
                     edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), result.refactored);
                     await vscode.workspace.applyEdit(edit);
-                    vscode.window.showInformationMessage(`âœ“ Neural Patch applied â€” ${linesChanged} lines transformed.`);
+                    vscode.window.showInformationMessage(`✓ Neural Patch applied — ${linesChanged} lines transformed.`);
                     vscode.commands.executeCommand('neuroforge.analyzeFile');
                 }
                 else {
@@ -814,7 +869,7 @@ async function activate(context) {
         }
         const fetchFn = getFetch();
         output.show(true);
-        output.appendLine('\nâ”â”â” NeuroForge Workspace Scan â”â”â”');
+        output.appendLine('\n━━━ NeuroForge Workspace Scan ━━━');
         const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py}', '**/node_modules/**', 40);
         const fileResults = [];
         await vscode.window.withProgress({
@@ -848,10 +903,10 @@ async function activate(context) {
                             return d;
                         });
                         diagnosticCollection.set(file, diags);
-                        output.appendLine(`  [!] ${file.path.split('/').pop()} â€” Score: ${score}%  Issues: ${weaknesses.length}`);
+                        output.appendLine(`  [!] ${file.path.split('/').pop()} — Score: ${score}%  Issues: ${weaknesses.length}`);
                     }
                     else {
-                        output.appendLine(`  [âœ“] ${file.path.split('/').pop()} â€” Score: ${score}%  Clean`);
+                        output.appendLine(`  [✓] ${file.path.split('/').pop()} — Score: ${score}%  Clean`);
                     }
                 }
                 catch { /* skip file */ }
@@ -861,18 +916,18 @@ async function activate(context) {
             ? Math.round(fileResults.reduce((a, b) => a + b.score, 0) / fileResults.length)
             : 0;
         const totalIssues = fileResults.reduce((a, b) => a + b.issues, 0);
-        output.appendLine(`\nâ”â”â” Workspace Report â”â”â”`);
+        output.appendLine(`\n━━━ Workspace Report ━━━`);
         output.appendLine(`  Files Scanned : ${fileResults.length}`);
         output.appendLine(`  Avg Score     : ${avgScore}%`);
         output.appendLine(`  Total Issues  : ${totalIssues}`);
-        vscode.window.showInformationMessage(`Workspace scan complete. ${fileResults.length} files â€” Avg score: ${avgScore}% â€” ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}.`);
+        vscode.window.showInformationMessage(`Workspace scan complete. ${fileResults.length} files — Avg score: ${avgScore}% — ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}.`);
     });
     // --- COMMAND: Neural Heatmap ---
     const heatmapDisposable = vscode.commands.registerCommand('neuroforge.showHeatmap', async () => {
         const fetchFn = getFetch();
         const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py}', '**/node_modules/**', 30);
         const panel = vscode.window.createWebviewPanel('neuroforgeHeatmap', 'NeuroForge: Neural Complexity Heatmap', vscode.ViewColumn.Two, { enableScripts: true });
-        panel.webview.html = `<body style="background:#02040a;color:#e6edf3;padding:30px;font-family:sans-serif;"><p>ðŸ”¥ Scanning workspace for complexity hotspots...</p></body>`;
+        panel.webview.html = `<body style="background:#02040a;color:#e6edf3;padding:30px;font-family:sans-serif;"><p>🔥 Scanning workspace for complexity hotspots...</p></body>`;
         const fileData = [];
         for (const file of files) {
             try {
@@ -923,7 +978,7 @@ async function activate(context) {
                 .empty { color: #8b949e; font-size: 14px; }
             </style></head>
             <body>
-                <h1>ðŸ”¥ Neural Complexity Heatmap</h1>
+                <h1>🔥 Neural Complexity Heatmap</h1>
                 <div class="legend">
                     <span>High Quality</span>
                     <div class="legend-bar"></div>

@@ -1,4 +1,5 @@
-﻿import * as vscode from 'vscode';
+import * as vscode from 'vscode';
+import { RiskIntelligenceFeature } from './features/riskIntelligenceFeature';
 
 const DEFAULT_AI_ENGINE_URL = 'http://127.0.0.1:8000';
 
@@ -65,7 +66,7 @@ function getInterviewHtml(questions: string[]): string {
         .score-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, #2f81f7, #3fb950); transition: width 1s; }
     </style></head>
     <body>
-        <h1>âš¡ NeuroForge Elite Interview Mode</h1>
+        <h1>⚡ NeuroForge Elite Interview Mode</h1>
         <p class="header-sub">Questions are generated from a deep analysis of your code's architecture, security posture, and behavioral patterns. Answer as you would in a Staff-level engineering interview.</p>
         ${questionItems}
         <script>
@@ -88,7 +89,7 @@ function getInterviewHtml(questions: string[]): string {
                     const btns = document.querySelectorAll('.submit-btn');
                     btns.forEach((btn, idx) => {
                         if (btn.disabled && btn.textContent === 'Evaluating...') {
-                            btn.textContent = 'âœ“ Evaluated';
+                            btn.textContent = '✓ Evaluated';
                             const fbBox = document.getElementById('fb' + idx);
                             const statusKey = (fb.status || 'Strong').split(' ')[0];
                             fbBox.innerHTML = \`
@@ -140,7 +141,7 @@ class NeuralCodeLensProvider implements vscode.CodeLensProvider {
         }));
 
         if (this.lastScore !== null) {
-            const color = this.lastScore >= 80 ? 'ðŸŸ¢' : this.lastScore >= 50 ? 'ðŸŸ¡' : 'ðŸ”´';
+            const color = this.lastScore >= 80 ? '🟢' : this.lastScore >= 50 ? '🟡' : '🔴';
             lenses.push(new vscode.CodeLens(topRange, {
                 title: `${color} Score: ${this.lastScore}%`,
                 command: ""
@@ -240,7 +241,7 @@ class NeuralSidebarProvider implements vscode.WebviewViewProvider {
                 </div>
 
                 <div class="card">
-                    <div class="label">Hotspots â€” ${weaknesses.length} issue${weaknesses.length !== 1 ? 's' : ''}</div>
+                    <div class="label">Hotspots — ${weaknesses.length} issue${weaknesses.length !== 1 ? 's' : ''}</div>
                     ${issuesHtml || '<div style="color:#8b949e;font-size:11px;margin-top:6px;">No critical issues detected</div>'}
                     ${weaknesses.length > 4 ? `<div style="font-size:10px;color:#8b949e;margin-top:6px;">+ ${weaknesses.length - 4} more</div>` : ''}
                 </div>
@@ -402,6 +403,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const output = vscode.window.createOutputChannel('NeuroForge');
     const diagnosticCollection = vscode.languages.createDiagnosticCollection('neuroforge');
     const lensProvider = new NeuralCodeLensProvider();
+    const riskIntelligence = new RiskIntelligenceFeature();
 
     const currentDiagnostics: vscode.Diagnostic[] = [];
 
@@ -413,7 +415,7 @@ export async function activate(context: vscode.ExtensionContext) {
         overviewRulerColor: 'rgba(218, 54, 51, 0.8)',
         overviewRulerLane: vscode.OverviewRulerLane.Right,
         after: {
-            contentText: ' âš ï¸ NEURAL SECURITY VULNERABILITY',
+            contentText: ' ⚠️ NEURAL SECURITY VULNERABILITY',
             color: 'rgba(218, 54, 51, 0.8)',
             margin: '0 0 0 10px',
             fontStyle: 'italic',
@@ -434,10 +436,10 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider(NeuralSidebarProvider.viewType, sidebarProvider)
     );
 
-    const chatProvider = new NeuralChatProvider(context.extensionUri);
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(NeuralChatProvider.viewType, chatProvider)
-    );
+    
+
+    riskIntelligence.register(context);
+    context.subscriptions.push(riskIntelligence);
 
     // --- Status Bar: NeuroForge Quick Access ---
     const analyzeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
@@ -487,7 +489,7 @@ export async function activate(context: vscode.ExtensionContext) {
             clearTimeout(timeout);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data: any = await res.json();
-            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} Â· ML: ${data.ml_available ? 'on' : 'off'} Â· Uptime: ${data.uptime_seconds ?? 0}s`);
+            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} · ML: ${data.ml_available ? 'on' : 'off'} · Uptime: ${data.uptime_seconds ?? 0}s`);
         } catch (e: any) {
             const msg = toErrorMessage(e);
             output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/health`);
@@ -683,7 +685,7 @@ export async function activate(context: vscode.ExtensionContext) {
                     const edit = new vscode.WorkspaceEdit();
                     edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), result.refactored);
                     await vscode.workspace.applyEdit(edit);
-                    vscode.window.showInformationMessage(`âœ“ Neural Patch applied â€” ${linesChanged} lines transformed.`);
+                    vscode.window.showInformationMessage(`✓ Neural Patch applied — ${linesChanged} lines transformed.`);
                     vscode.commands.executeCommand('neuroforge.analyzeFile');
                 } else {
                     vscode.window.showErrorMessage(`Patch failed: ${result.message || 'Unknown error'}`);
@@ -926,7 +928,7 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         const fetchFn = getFetch();
         output.show(true);
-        output.appendLine('\nâ”â”â” NeuroForge Workspace Scan â”â”â”');
+        output.appendLine('\n━━━ NeuroForge Workspace Scan ━━━');
 
         const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py}', '**/node_modules/**', 40);
         const fileResults: { path: string; score: number; issues: number }[] = [];
@@ -967,9 +969,9 @@ export async function activate(context: vscode.ExtensionContext) {
                             return d;
                         });
                         diagnosticCollection.set(file, diags);
-                        output.appendLine(`  [!] ${file.path.split('/').pop()} â€” Score: ${score}%  Issues: ${weaknesses.length}`);
+                        output.appendLine(`  [!] ${file.path.split('/').pop()} — Score: ${score}%  Issues: ${weaknesses.length}`);
                     } else {
-                        output.appendLine(`  [âœ“] ${file.path.split('/').pop()} â€” Score: ${score}%  Clean`);
+                        output.appendLine(`  [✓] ${file.path.split('/').pop()} — Score: ${score}%  Clean`);
                     }
                 } catch { /* skip file */ }
             }
@@ -980,13 +982,13 @@ export async function activate(context: vscode.ExtensionContext) {
             : 0;
         const totalIssues = fileResults.reduce((a, b) => a + b.issues, 0);
 
-        output.appendLine(`\nâ”â”â” Workspace Report â”â”â”`);
+        output.appendLine(`\n━━━ Workspace Report ━━━`);
         output.appendLine(`  Files Scanned : ${fileResults.length}`);
         output.appendLine(`  Avg Score     : ${avgScore}%`);
         output.appendLine(`  Total Issues  : ${totalIssues}`);
 
         vscode.window.showInformationMessage(
-            `Workspace scan complete. ${fileResults.length} files â€” Avg score: ${avgScore}% â€” ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}.`
+            `Workspace scan complete. ${fileResults.length} files — Avg score: ${avgScore}% — ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}.`
         );
     });
 
@@ -1002,7 +1004,7 @@ export async function activate(context: vscode.ExtensionContext) {
             { enableScripts: true }
         );
 
-        panel.webview.html = `<body style="background:#02040a;color:#e6edf3;padding:30px;font-family:sans-serif;"><p>ðŸ”¥ Scanning workspace for complexity hotspots...</p></body>`;
+        panel.webview.html = `<body style="background:#02040a;color:#e6edf3;padding:30px;font-family:sans-serif;"><p>🔥 Scanning workspace for complexity hotspots...</p></body>`;
 
         const fileData: { name: string; score: number; issues: number; complexity: number }[] = [];
 
@@ -1057,7 +1059,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 .empty { color: #8b949e; font-size: 14px; }
             </style></head>
             <body>
-                <h1>ðŸ”¥ Neural Complexity Heatmap</h1>
+                <h1>🔥 Neural Complexity Heatmap</h1>
                 <div class="legend">
                     <span>High Quality</span>
                     <div class="legend-bar"></div>
@@ -1206,4 +1208,7 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() { }
+
+
+
 
