@@ -1004,7 +1004,41 @@ async function activate(context) {
             }
         });
     });
-    context.subscriptions.push(analyzeDisposable, explainDisposable, dnaDisposable, applyFixDisposable, codeActionProvider, vscode.languages.registerCodeLensProvider(['javascript', 'typescript', 'python'], lensProvider), analyzeBtn, timeTrackerBar, typingDisposable, autoAnalyzeDisposable, interviewDisposable, workspaceDisposable, heatmapDisposable, generateTestsDisposable, generateDocsDisposable);
+    // --- EXPERIMENTAL: Neural Autocomplete (Ghost Text) ---
+    const autocompleteProvider = vscode.languages.registerInlineCompletionItemProvider(['python', 'javascript', 'typescript', 'javascriptreact', 'typescriptreact'], {
+        async provideInlineCompletionItems(document, position, context, token) {
+            // Determine context boundaries
+            const prefixRange = new vscode.Range(new vscode.Position(0, 0), position);
+            const suffixRange = new vscode.Range(position, new vscode.Position(document.lineCount, 0));
+            const prefix = document.getText(prefixRange);
+            const suffix = document.getText(suffixRange);
+            if (prefix.trim().length < 5)
+                return [];
+            try {
+                const fetchFn = getFetch();
+                const res = await fetchFn(`${getAiEngineUrl()}/autocomplete`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prefix,
+                        suffix,
+                        language: document.languageId
+                    }),
+                });
+                if (token.isCancellationRequested)
+                    return [];
+                const data = await res.json();
+                if (data.status === 'success' && data.completion) {
+                    return [new vscode.InlineCompletionItem(data.completion, new vscode.Range(position, position))];
+                }
+            }
+            catch (e) {
+                // Fail silently for autocomplete so we don't spam the user
+            }
+            return [];
+        }
+    });
+    context.subscriptions.push(analyzeDisposable, explainDisposable, dnaDisposable, applyFixDisposable, codeActionProvider, vscode.languages.registerCodeLensProvider(['javascript', 'typescript', 'python'], lensProvider), analyzeBtn, timeTrackerBar, typingDisposable, autoAnalyzeDisposable, interviewDisposable, workspaceDisposable, heatmapDisposable, generateTestsDisposable, generateDocsDisposable, autocompleteProvider);
     context.subscriptions.push(vscode.commands.registerCommand('neuroforge.healthCheck', checkHealth));
 }
 function deactivate() { }

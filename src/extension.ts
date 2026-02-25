@@ -403,6 +403,32 @@ export async function activate(context: vscode.ExtensionContext) {
     const diagnosticCollection = vscode.languages.createDiagnosticCollection('neuroforge');
     const lensProvider = new NeuralCodeLensProvider();
 
+    const currentDiagnostics: vscode.Diagnostic[] = [];
+
+    // --- DECORATION STYLES ---
+    const criticalSecurityDecoration = vscode.window.createTextEditorDecorationType({
+        backgroundColor: 'rgba(218, 54, 51, 0.2)', // Glowing red background
+        isWholeLine: true,
+        border: '1px solid rgba(218, 54, 51, 0.6)',
+        overviewRulerColor: 'rgba(218, 54, 51, 0.8)',
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+        after: {
+            contentText: ' âš ï¸ NEURAL SECURITY VULNERABILITY',
+            color: 'rgba(218, 54, 51, 0.8)',
+            margin: '0 0 0 10px',
+            fontStyle: 'italic',
+            fontWeight: 'bold'
+        }
+    });
+
+    const highSecurityDecoration = vscode.window.createTextEditorDecorationType({
+        backgroundColor: 'rgba(227, 179, 65, 0.15)', // Glowing yellow background
+        isWholeLine: true,
+        overviewRulerColor: 'rgba(227, 179, 65, 0.8)',
+        overviewRulerLane: vscode.OverviewRulerLane.Right,
+    });
+
+
     const sidebarProvider = new NeuralSidebarProvider(context.extensionUri);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(NeuralSidebarProvider.viewType, sidebarProvider)
@@ -548,6 +574,39 @@ export async function activate(context: vscode.ExtensionContext) {
             });
 
             diagnosticCollection.set(doc.uri, diagnostics);
+
+            // --- Apply Security Decorations ---
+            const secVulnerabilities = data.security?.vulnerabilities || [];
+            if (secVulnerabilities.length > 0 && editor) {
+                const codeLines = code.split('\n');
+                const criticalRanges: vscode.Range[] = [];
+                const highRanges: vscode.Range[] = [];
+
+                secVulnerabilities.forEach((v: any) => {
+                    // Primitive matching logic for MVP visual appeal
+                    let matchedLine = 0;
+                    if (v.type.includes('Injection')) {
+                        matchedLine = codeLines.findIndex(l => l.includes('execute') || l.includes('system'));
+                    } else if (v.type.includes('Key Exposure')) {
+                        matchedLine = codeLines.findIndex(l => l.includes('BEGIN') && l.includes('KEY'));
+                    } else if (v.type.includes('Leak') || v.type.includes('Secret')) {
+                        matchedLine = codeLines.findIndex(l => l.includes('secret') || l.includes('password') || l.includes('api_key') || l.includes('://'));
+                    }
+
+                    if (matchedLine !== -1 && matchedLine >= 0) {
+                        const range = doc.lineAt(matchedLine).range;
+                        if (v.severity === 'Critical') {
+                            criticalRanges.push(range);
+                        } else {
+                            highRanges.push(range);
+                        }
+                    }
+                });
+
+                editor.setDecorations(criticalSecurityDecoration, criticalRanges);
+                editor.setDecorations(highSecurityDecoration, highRanges);
+            }
+
             sidebarProvider.updateView(data);
             vscode.window.showInformationMessage(`NeuroForge: ${weaknesses.length} potential issues identified.`);
 
