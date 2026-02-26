@@ -88,7 +88,45 @@ const HEALTH_OK_CACHE_MS = 15000;
 const HEALTH_FAIL_CACHE_MS = 5000;
 let healthCache: EngineHealthCache | null = null;
 let engineStatusBar: vscode.StatusBarItem | null = null;
+let pushStatusBar: vscode.StatusBarItem | null = null;
+let autoPushTerminal: vscode.Terminal | null = null;
+let autoPushEnabled = false;
+let lastAutoPushAt: number | null = null;
+let autoPushLogWatcher: vscode.FileSystemWatcher | null = null;
+type StatusState = {
+    engine: {
+        online: boolean;
+        url: string;
+        version?: string;
+        lastChecked?: string;
+        lastError?: string;
+    };
+    autoPush: {
+        enabled: boolean;
+        intervalSeconds: number;
+        prefix: string;
+    };
+    lastPush: {
+        time?: string;
+        ok?: boolean;
+        summary?: string;
+    };
+};
 
+const statusState: StatusState = {
+    engine: {
+        online: false,
+        url: DEFAULT_AI_ENGINE_URL
+    },
+    autoPush: {
+        enabled: false,
+        intervalSeconds: 60,
+        prefix: 'AI message'
+    },
+    lastPush: {}
+};
+
+let lastSidebarData: any = {};
 function updateEngineStatus(online: boolean, detail?: string): void {
     if (!engineStatusBar) return;
     if (online) {
@@ -110,27 +148,252 @@ async function ensureEngineReachable(engineUrl: string, output?: vscode.OutputCh
     if (healthCache) {
         const ttl = healthCache.ok ? HEALTH_OK_CACHE_MS : HEALTH_FAIL_CACHE_MS;
         if (now - healthCache.checkedAt < ttl) {
+            statusState.engine.url = engineUrl;
             return healthCache.ok;
         }
     }
 
     try {
-        const res = await fetchWithRetry(`${engineUrl}/health`, {}, { timeoutMs: 2500, retries: 0 });
+        const res = await fetchWithRetry(`${engineUrl}/status/summary`, {}, { timeoutMs: 2500, retries: 0 });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        let version: string | undefined;
+        try {
+            const data: any = await res.clone().json();
+            version = data?.version;
+        } catch {
+            // ignore JSON parse errors for status.
+        }
         healthCache = { ok: true, checkedAt: now };
+        statusState.engine = {
+            online: true,
+            url: engineUrl,
+            version,
+            lastChecked: new Date().toISOString()
+        };
         updateEngineStatus(true);
         return true;
     } catch (err) {
-        const msg = toErrorMessage(err);
-        healthCache = { ok: false, checkedAt: now, message: msg };
-        updateEngineStatus(false, msg);
-        if (output) {
-            output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/health`);
-            output.appendLine(`[ERROR] ${msg}`);
+        // Fallback to legacy /health for older engine builds.
+        try {
+            const res = await fetchWithRetry(`${engineUrl}/health`, {}, { timeoutMs: 2500, retries: 0 });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            let version: string | undefined;
+            try {
+                const data: any = await res.clone().json();
+                version = data?.version;
+            } catch {
+                // ignore JSON parse errors for status.
+            }
+            healthCache = { ok: true, checkedAt: now };
+            statusState.engine = {
+                online: true,
+                url: engineUrl,
+                version,
+                lastChecked: new Date().toISOString()
+            };
+            updateEngineStatus(true);
+            return true;
+        } catch (fallbackErr) {
+            const msg = toErrorMessage(fallbackErr);
+            healthCache = { ok: false, checkedAt: now, message: msg };
+            statusState.engine = {
+                online: false,
+                url: engineUrl,
+                lastChecked: new Date().toISOString(),
+                lastError: msg
+            };
+            updateEngineStatus(false, msg);
+            if (output) {
+                output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/status/summary and /health`);
+                output.appendLine(`[ERROR] ${msg}`);
+            }
+            vscode.window.showErrorMessage(`NeuroForge engine unreachable at ${engineUrl}: ${msg}`);
+            return false;
         }
-        vscode.window.showErrorMessage(`NeuroForge engine unreachable at ${engineUrl}: ${msg}`);
-        return false;
     }
+}
+
+function toPosixPath(value: string): string {
+    return value.replace(/\\/g, '/');
+}
+
+function stripKnownExtension(filePath: string): string {
+    return filePath.replace(/\.(ts|tsx|js|jsx|py)$/i, '');
+}
+
+function extractImportSpecifiers(code: string): string[] {
+    const specifiers = new Set<string>();
+    const patterns = [
+        /import\s+[^'"]*?from\s+['"]([^'"]+)['"]/g,
+        /import\s+['"]([^'"]+)['"]/g,
+        /require\(\s*['"]([^'"]+)['"]\s*\)/g,
+        /from\s+['"]([^'"]+)['"]\s+import/g,
+        /import\s+([a-zA-Z0-9_.]+)\s*$/gm
+    ];
+    for (const pattern of patterns) {
+        let match: RegExpExecArray | null;
+        while ((match = pattern.exec(code)) !== null) {
+            if (match[1]) specifiers.add(match[1]);
+        }
+    }
+    return Array.from(specifiers);
+}
+
+function escapeHtml(value: string): string {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function escapeAttribute(value: string): string {
+    return escapeHtml(value).replace(/`/g, '&#96;');
+}
+
+async function resolveImportToFile(baseDir: string, specifier: string): Promise<string | null> {
+    if (!specifier.startsWith('.')) return null;
+    const basePath = path.resolve(baseDir, specifier);
+    const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        `${basePath}.js`,
+        `${basePath}.jsx`,
+        `${basePath}.py`,
+        path.join(basePath, 'index.ts'),
+        path.join(basePath, 'index.tsx'),
+        path.join(basePath, 'index.js'),
+        path.join(basePath, 'index.jsx'),
+        path.join(basePath, 'index.py')
+    ];
+    for (const candidate of candidates) {
+        try {
+            await vscode.workspace.fs.stat(vscode.Uri.file(candidate));
+            return candidate;
+        } catch {
+            // try next
+        }
+    }
+    return null;
+}
+
+function getBlastRadiusHtml(target: string, imports: string[], importedBy: string[]): string {
+    const importItems = imports.length
+        ? imports.map((spec, idx) => `
+            <div class="row">
+                <div class="path">${escapeHtml(spec)}</div>
+                <button class="btn" data-import="${escapeHtml(spec)}">Open</button>
+            </div>
+        `).join('')
+        : '<div class="muted">No imports detected.</div>';
+
+    const importerItems = importedBy.length
+        ? importedBy.map((file, idx) => `
+            <div class="row">
+                <div class="path">${escapeHtml(file)}</div>
+                <button class="btn" data-file="${escapeHtml(file)}">Open</button>
+            </div>
+        `).join('')
+        : '<div class="muted">No importers detected.</div>';
+
+    return `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body { background: #0d1117; color: #e6edf3; font-family: -apple-system, "Segoe UI", sans-serif; padding: 16px; }
+                h1 { font-size: 16px; margin: 0 0 8px; color: #58a6ff; }
+                h2 { font-size: 12px; margin: 16px 0 8px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+                .muted { color: #8b949e; font-size: 12px; }
+                .path { font-size: 12px; word-break: break-all; }
+                .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 6px; background: #161b22; }
+                .btn { background: #238636; color: #fff; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+                .btn:hover { background: #2ea043; }
+                .section { margin-top: 10px; }
+                .target { font-size: 12px; color: #c9d1d9; }
+            </style>
+        </head>
+        <body>
+            <h1>Blast Radius</h1>
+            <div class="target">${escapeHtml(target)}</div>
+
+            <div class="section">
+                <h2>Imports</h2>
+                ${importItems}
+            </div>
+
+            <div class="section">
+                <h2>Imported By</h2>
+                ${importerItems}
+            </div>
+
+            <script>
+                const vscode = acquireVsCodeApi();
+                document.querySelectorAll('button[data-file]').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        vscode.postMessage({ command: 'openFile', file: btn.dataset.file });
+                    });
+                });
+                document.querySelectorAll('button[data-import]').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        vscode.postMessage({ command: 'openImport', spec: btn.dataset.import });
+                    });
+                });
+            </script>
+        </body>
+        </html>
+    `;
+}
+
+async function computeBlastRadius(target: vscode.Uri): Promise<{ imports: string[]; importedBy: string[] }> {
+    const doc = await vscode.workspace.openTextDocument(target);
+    const code = doc.getText();
+    const imports = extractImportSpecifiers(code);
+
+    const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,py}', '**/node_modules/**', 200);
+    const importedBy: string[] = [];
+    const targetPath = target.fsPath;
+    const targetDir = path.dirname(targetPath);
+    const targetBaseNoExt = stripKnownExtension(path.basename(targetPath));
+    const targetRelFromRoot = toPosixPath(path.relative(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', targetPath));
+    const targetRelNoExt = stripKnownExtension(targetRelFromRoot);
+
+    const aliasSpecifiers = new Set<string>([
+        `./${targetBaseNoExt}`,
+        targetBaseNoExt,
+        targetRelNoExt,
+        `/${targetRelNoExt}`
+    ]);
+
+    for (const file of files) {
+        if (file.fsPath === targetPath) continue;
+        const candidate = await vscode.workspace.openTextDocument(file);
+        const text = candidate.getText();
+        const candidateDir = path.dirname(file.fsPath);
+        const rel = toPosixPath(path.relative(candidateDir, targetPath));
+        const relNoExt = stripKnownExtension(rel);
+        const relNoExtNormalized = relNoExt.startsWith('.') ? relNoExt : `./${relNoExt}`;
+
+        const specifiers = new Set<string>([
+            relNoExtNormalized,
+            relNoExtNormalized.replace(/^\.\//, ''),
+            ...aliasSpecifiers
+        ]);
+
+        let hit = false;
+        for (const spec of specifiers) {
+            if (new RegExp(`['"]${spec}['"]`).test(text)) {
+                hit = true;
+                break;
+            }
+        }
+        if (hit) importedBy.push(file.fsPath);
+    }
+
+    return { imports, importedBy };
 }
 
 function getInterviewLoadingHtml(): string {
@@ -147,11 +410,11 @@ function getInterviewLoadingHtml(): string {
 
 function getInterviewHtml(questions: string[]): string {
     const questionItems = questions.map((q, i) => `
-        <div class="question-block" id="q${i}" data-question="${q.replace(/"/g, '&quot;')}">
+        <div class="question-block" id="q${i}" data-index="${i}" data-question="${escapeAttribute(q)}">
             <div class="q-num">Q${i + 1} <span class="q-badge">Neural Challenge</span></div>
-            <div class="q-text">${q}</div>
+            <div class="q-text">${escapeHtml(q)}</div>
             <textarea class="answer-box" id="ans${i}" placeholder="Type your architectural answer here..."></textarea>
-            <button class="submit-btn" onclick="submitAnswer(${i})">$(send) Submit to Neural Evaluator</button>
+            <button class="submit-btn" onclick="submitAnswer(${i})">Submit to Neural Evaluator</button>
             <div class="feedback-box" id="fb${i}" style="display:none;"></div>
         </div>`).join('');
 
@@ -198,7 +461,7 @@ function getInterviewHtml(questions: string[]): string {
                 const btn = qEl.querySelector('button');
                 btn.disabled = true;
                 btn.textContent = 'Evaluating...';
-                vscode.postMessage({ command: 'submitAnswer', question, answer });
+                vscode.postMessage({ command: 'submitAnswer', question, answer, index: idx });
             }
             window.addEventListener('message', (event) => {
                 const msg = event.data;
@@ -297,6 +560,15 @@ class NeuralSidebarProvider implements vscode.WebviewViewProvider {
                 case 'analyze': vscode.commands.executeCommand('neuroforge.analyzeFile'); break;
                 case 'dna': vscode.commands.executeCommand('neuroforge.showNeuralDNA'); break;
                 case 'explain': vscode.commands.executeCommand('neuroforge.explainCode'); break;
+                case 'push': vscode.commands.executeCommand('neuroforge.pushNow'); break;
+                case 'autoPushStart': vscode.commands.executeCommand('neuroforge.startAutoPush'); break;
+                case 'autoPushStop': vscode.commands.executeCommand('neuroforge.stopAutoPush'); break;
+                case 'refreshStatus': vscode.commands.executeCommand('neuroforge.healthCheck'); break;
+                case 'blast': vscode.commands.executeCommand('neuroforge.blastRadiusView'); break;
+                case 'blastCopy': vscode.commands.executeCommand('neuroforge.blastRadiusCopy'); break;
+                case 'contractDrift': vscode.commands.executeCommand('neuroforge.contractDrift'); break;
+                case 'suite': vscode.commands.executeCommand('neuroforge.intelligenceSuite'); break;
+                case 'launcher': vscode.commands.executeCommand('neuroforge.launcher'); break;
             }
         });
 
@@ -314,6 +586,20 @@ class NeuralSidebarProvider implements vscode.WebviewViewProvider {
         const dominantTrait: string = data?.behavior?.dominant_trait || 'Run Analysis to Begin';
         const skills: string[] = data?.skills || [];
         const perfIndex: number = data?.behavior?.performance_index ?? 0;
+        const status = data?.status ?? {};
+        const engineStatus = status.engine ?? {};
+        const autoPushStatus = status.autoPush ?? {};
+        const lastPushStatus = status.lastPush ?? {};
+        const engineStateText = engineStatus.online ? 'Online' : 'Offline';
+        const engineUrlText = engineStatus.url || DEFAULT_AI_ENGINE_URL;
+        const engineVersionText = engineStatus.version || 'unknown';
+        const engineCheckedText = engineStatus.lastChecked || 'n/a';
+        const autoPushStateText = autoPushStatus.enabled ? 'Running' : 'Stopped';
+        const autoPushIntervalText = autoPushStatus.intervalSeconds ?? 60;
+        const autoPushPrefixText = autoPushStatus.prefix ?? 'AI message';
+        const lastPushTimeText = lastPushStatus.time || 'n/a';
+        const lastPushResultText = lastPushStatus.ok === true ? 'Success' : lastPushStatus.ok === false ? 'Failure' : 'Unknown';
+        const lastPushSummaryText = lastPushStatus.summary || 'n/a';
 
         const scoreColor = score === '---' ? '#8b949e'
             : score >= 80 ? '#3fb950'
@@ -354,6 +640,13 @@ class NeuralSidebarProvider implements vscode.WebviewViewProvider {
                     .btn-ghost { background: rgba(255,255,255,0.06); }
                     .btn-ghost:hover { background: rgba(255,255,255,0.12); }
                     .divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 8px 0; }
+                    .status-row { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; margin-top: 6px; }
+                    .status-key { color: #8b949e; }
+                    .status-value { color: #e6edf3; font-weight: 600; text-align: right; }
+                    .status-value.ok { color: #3fb950; }
+                    .status-value.bad { color: #f85149; }
+                    .status-muted { color: #8b949e; font-size: 10px; margin-top: 4px; }
+                    .status-block { margin-top: 8px; }
                 </style>
             </head>
             <body>
@@ -377,18 +670,79 @@ class NeuralSidebarProvider implements vscode.WebviewViewProvider {
                     <div style="margin-top: 6px;">${skillsHtml}</div>
                 </div>
 
+                <div class="card">
+                    <div class="label">NeuroForge Status</div>
+                    <div class="status-block">
+                        <div class="status-row">
+                            <div class="status-key">Engine</div>
+                            <div class="status-value ${engineStatus.online ? 'ok' : 'bad'}">${engineStateText}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">URL</div>
+                            <div class="status-value">${escapeHtml(String(engineUrlText))}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">Version</div>
+                            <div class="status-value">${escapeHtml(String(engineVersionText))}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">Last Check</div>
+                            <div class="status-value">${escapeHtml(String(engineCheckedText))}</div>
+                        </div>
+                    </div>
+                    <div class="status-block">
+                        <div class="status-row">
+                            <div class="status-key">Auto Push</div>
+                            <div class="status-value">${autoPushStateText}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">Interval</div>
+                            <div class="status-value">${escapeHtml(String(autoPushIntervalText))}s</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">Prefix</div>
+                            <div class="status-value">${escapeHtml(String(autoPushPrefixText))}</div>
+                        </div>
+                    </div>
+                    <div class="status-block">
+                        <div class="status-row">
+                            <div class="status-key">Last Push</div>
+                            <div class="status-value">${lastPushResultText}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">Time</div>
+                            <div class="status-value">${escapeHtml(String(lastPushTimeText))}</div>
+                        </div>
+                        <div class="status-row">
+                            <div class="status-key">Summary</div>
+                            <div class="status-value">${escapeHtml(String(lastPushSummaryText))}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <button class="btn" id="btn-refresh">$(sync) Refresh Status</button>
                 <button class="btn" id="btn-analyze">$(zap) Re-Analyze File</button>
+                <button class="btn" id="btn-suite" style="background:#2f81f7;">$(dashboard) Intelligence Suite</button>
+                <button class="btn" id="btn-push">$(cloud-upload) Push Now</button>
+                <button class="btn btn-ghost" id="btn-blast">$(search) Blast Radius</button>
+                <button class="btn btn-ghost" id="btn-launcher">$(rocket) Quick Launcher</button>
                 <button class="btn btn-ghost" id="btn-dna">$(beaker) Digital Twin DNA</button>
                 <button class="btn btn-ghost" id="btn-explain">$(comment-discussion) Explain This Code</button>
 
                 <script>
                     const vscode = acquireVsCodeApi();
+                    document.getElementById('btn-refresh').addEventListener('click', () => vscode.postMessage({ command: 'refreshStatus' }));
                     document.getElementById('btn-analyze').addEventListener('click', () => vscode.postMessage({ command: 'analyze' }));
+                    document.getElementById('btn-suite').addEventListener('click', () => vscode.postMessage({ command: 'suite' }));
+                    document.getElementById('btn-push').addEventListener('click', () => vscode.postMessage({ command: 'push' }));
+                    document.getElementById('btn-blast').addEventListener('click', () => vscode.postMessage({ command: 'blast' }));
+                    document.getElementById('btn-launcher').addEventListener('click', () => vscode.postMessage({ command: 'launcher' }));
                     document.getElementById('btn-dna').addEventListener('click', () => vscode.postMessage({ command: 'dna' }));
                     document.getElementById('btn-explain').addEventListener('click', () => vscode.postMessage({ command: 'explain' }));
                 </script>
             </body>
             </html>
+
         `;
     }
 }
@@ -566,7 +920,39 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider(NeuralSidebarProvider.viewType, sidebarProvider)
     );
 
-    
+    const refreshSidebar = (data?: any) => {
+        if (data) {
+            lastSidebarData = data;
+        }
+        sidebarProvider.updateView({
+            ...lastSidebarData,
+            status: statusState
+        });
+    };
+
+    const syncAutoPushConfig = () => {
+        const config = vscode.workspace.getConfiguration('neuroforge');
+        statusState.autoPush.intervalSeconds = config.get<number>('autoPushIntervalSeconds') ?? 60;
+        statusState.autoPush.prefix = config.get<string>('autoPushMessagePrefix') ?? 'AI message';
+        statusState.autoPush.enabled = autoPushEnabled;
+    };
+
+    syncAutoPushConfig();
+    refreshSidebar();
+
+    const configDisposable = vscode.workspace.onDidChangeConfiguration(event => {
+        if (
+            event.affectsConfiguration('neuroforge.aiEngineUrl')
+            || event.affectsConfiguration('neuroforge.autoPushIntervalSeconds')
+            || event.affectsConfiguration('neuroforge.autoPushMessagePrefix')
+            || event.affectsConfiguration('neuroforge.autoPushRepos')
+        ) {
+            syncAutoPushConfig();
+            const url = getAiEngineUrl();
+            statusState.engine.url = url;
+            void ensureEngineReachable(url, output).then(() => refreshSidebar());
+        }
+    });
 
     riskIntelligence.register(context);
     context.subscriptions.push(riskIntelligence);
@@ -577,11 +963,18 @@ export async function activate(context: vscode.ExtensionContext) {
     engineStatusBar.tooltip = 'NeuroForge AI engine status';
     engineStatusBar.command = 'neuroforge.healthCheck';
     engineStatusBar.show();
-    void ensureEngineReachable(getAiEngineUrl(), output);
+    void ensureEngineReachable(getAiEngineUrl(), output).then(() => refreshSidebar());
     const engineStatusTimer = setInterval(() => {
-        void ensureEngineReachable(getAiEngineUrl(), output);
+        void ensureEngineReachable(getAiEngineUrl(), output).then(() => refreshSidebar());
     }, 60000);
     context.subscriptions.push(new vscode.Disposable(() => clearInterval(engineStatusTimer)));
+
+    // --- Push Status Bar ---
+    pushStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 998);
+    pushStatusBar.text = '$(cloud-upload) NF Push';
+    pushStatusBar.tooltip = 'Push changes to GitHub now';
+    pushStatusBar.command = 'neuroforge.pushNow';
+    pushStatusBar.show();
 
     // --- Status Bar: NeuroForge Quick Access ---
     const analyzeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
@@ -620,20 +1013,35 @@ export async function activate(context: vscode.ExtensionContext) {
         const engineUrl = getAiEngineUrl();
         try {
             const res = await fetchWithRetry(
-                `${engineUrl}/health`,
+                `${engineUrl}/status/summary`,
                 {},
                 { timeoutMs: 4000, retries: 0 }
             );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data: any = await res.json();
-            updateEngineStatus(true, `ML: ${data.ml_available ? 'on' : 'off'} | Uptime: ${data.uptime_seconds ?? 0}s`);
-            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} | ML: ${data.ml_available ? 'on' : 'off'} | Uptime: ${data.uptime_seconds ?? 0}s`);
+            const version = data.version ? ` | Version: ${data.version}` : '';
+            updateEngineStatus(true, `ML: ${data.ml_available ? 'on' : 'off'} | Uptime: ${data.uptime_seconds ?? 0}s${version}`);
+            vscode.window.showInformationMessage(`NeuroForge engine: ${data.status ?? 'online'} | ML: ${data.ml_available ? 'on' : 'off'} | Uptime: ${data.uptime_seconds ?? 0}s${version}`);
+            statusState.engine = {
+                online: true,
+                url: engineUrl,
+                version: data.version,
+                lastChecked: new Date().toISOString()
+            };
+            refreshSidebar();
         } catch (e: any) {
             const msg = toErrorMessage(e);
-            output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/health`);
+            output.appendLine(`[ERROR] Engine health check failed at ${engineUrl}/status/summary`);
             output.appendLine(`[ERROR] ${msg}`);
             updateEngineStatus(false, msg);
             vscode.window.showErrorMessage(`NeuroForge engine unreachable at ${engineUrl}: ${msg}`);
+            statusState.engine = {
+                online: false,
+                url: engineUrl,
+                lastChecked: new Date().toISOString(),
+                lastError: msg
+            };
+            refreshSidebar();
         }
     };
 
@@ -657,6 +1065,471 @@ export async function activate(context: vscode.ExtensionContext) {
         terminal.show(true);
         terminal.sendText('python main.py', true);
         vscode.window.showInformationMessage(`Starting NeuroForge AI Engine in ${cwd}`);
+    });
+
+    const setEngineUrlDisposable = vscode.commands.registerCommand('neuroforge.setEngineUrl', async () => {
+        const current = vscode.workspace.getConfiguration('neuroforge').get<string>('aiEngineUrl') || DEFAULT_AI_ENGINE_URL;
+        const input = await vscode.window.showInputBox({
+            title: 'NeuroForge: Set AI Engine URL',
+            prompt: 'Enter base URL for the AI engine (no trailing slash).',
+            value: current,
+            validateInput: (value) => {
+                if (!value || !value.trim()) return 'URL is required.';
+                if (!/^https?:\/\//i.test(value.trim())) return 'URL must start with http:// or https://';
+                return null;
+            }
+        });
+        if (!input) return;
+
+        const normalized = input.trim().replace(/\/+$/, '');
+        const config = vscode.workspace.getConfiguration('neuroforge');
+        await config.update('aiEngineUrl', normalized, vscode.ConfigurationTarget.Global);
+        vscode.window.showInformationMessage(`NeuroForge AI engine URL set to ${normalized}`);
+        statusState.engine.url = normalized;
+        void ensureEngineReachable(normalized, output).then(() => refreshSidebar());
+    });
+
+    const pushNowDisposable = vscode.commands.registerCommand('neuroforge.pushNow', async () => {
+        if (pushStatusBar) {
+            pushStatusBar.text = '$(sync~spin) NF Push';
+        }
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage('Open a workspace to push changes.');
+            return;
+        }
+
+        const repoList = vscode.workspace.getConfiguration('neuroforge').get<string[]>('autoPushRepos')
+            ?? ['ai-engine', 'vscode-extension'];
+        const messagePrefix = vscode.workspace.getConfiguration('neuroforge').get<string>('autoPushMessagePrefix')
+            ?? 'AI message';
+
+        if (repoList.length === 0) {
+            vscode.window.showWarningMessage('No repositories configured for push.');
+            return;
+        }
+
+        const timestamp = new Date().toISOString().replace('T', ' ').replace('Z', '');
+        const message = `${messagePrefix}: ${timestamp}`;
+        const safeMessage = `'${message.replace(/'/g, "''")}'`;
+        const pushScript = path.join(workspaceFolder.uri.fsPath, 'push-all.ps1');
+
+        const terminal = vscode.window.createTerminal({ name: 'NeuroForge Push', cwd: workspaceFolder.uri.fsPath });
+        terminal.show(true);
+
+        const repoArgs = `-Repos ${repoList.join(',')}`;
+        const cmd = `powershell -ExecutionPolicy Bypass -File "${pushScript}" -Message ${safeMessage} ${repoArgs}`;
+        terminal.sendText(cmd, true);
+        lastAutoPushAt = Date.now();
+        statusState.lastPush = {
+            time: new Date().toISOString(),
+            ok: true,
+            summary: 'Push triggered'
+        };
+        refreshSidebar();
+        if (pushStatusBar) {
+            pushStatusBar.text = autoPushEnabled ? '$(cloud-upload) NF Push (Auto)' : '$(cloud-upload) NF Push';
+            pushStatusBar.tooltip = 'Push changes to GitHub now';
+        }
+    });
+
+    const tailAutoPushLog = async () => {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) return;
+        const logPath = path.join(workspaceFolder.uri.fsPath, 'auto-push.log');
+        try {
+            const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(logPath));
+            const text = Buffer.from(bytes).toString('utf8');
+            const lines = text.split(/\r?\n/).filter(Boolean);
+            const tail = lines.slice(-40).join('\n');
+            output.appendLine('\n--- Auto Push Log (tail) ---');
+            output.appendLine(tail || '(no log output)');
+            const recent = lines.slice(-40).reverse();
+            const resultLine = recent.find(line => /Pushed to origin/i.test(line) || /Failed:/i.test(line));
+            if (resultLine) {
+                const timeMatch = resultLine.match(/^\[([^\]]+)\]\s*/);
+                const timestamp = timeMatch ? timeMatch[1] : new Date().toISOString();
+                const ok = /Pushed to origin/i.test(resultLine) && !/Failed:/i.test(resultLine);
+                statusState.lastPush = {
+                    time: timestamp,
+                    ok,
+                    summary: resultLine.replace(/^\[[^\]]+\]\s*/, '')
+                };
+                refreshSidebar();
+            }
+        } catch {
+            output.appendLine('[AutoPush] Unable to read auto-push.log');
+        }
+    };
+
+    const watchAutoPushLog = () => {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) return;
+        if (autoPushLogWatcher) {
+            autoPushLogWatcher.dispose();
+        }
+        const pattern = new vscode.RelativePattern(workspaceFolder, 'auto-push.log');
+        autoPushLogWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+        autoPushLogWatcher.onDidChange(() => { void tailAutoPushLog(); });
+        autoPushLogWatcher.onDidCreate(() => { void tailAutoPushLog(); });
+    };
+
+    const startAutoPushDisposable = vscode.commands.registerCommand('neuroforge.startAutoPush', async () => {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage('Open a workspace to start auto-push.');
+            return;
+        }
+
+        const intervalSeconds = vscode.workspace.getConfiguration('neuroforge').get<number>('autoPushIntervalSeconds')
+            ?? 60;
+        const messagePrefix = vscode.workspace.getConfiguration('neuroforge').get<string>('autoPushMessagePrefix')
+            ?? 'AI message';
+        const pushScript = path.join(workspaceFolder.uri.fsPath, 'auto-push-loop.ps1');
+
+        if (autoPushTerminal) autoPushTerminal.dispose();
+        autoPushTerminal = vscode.window.createTerminal({ name: 'NeuroForge Auto Push', cwd: workspaceFolder.uri.fsPath });
+        autoPushTerminal.show(true);
+        const cmd = `powershell -ExecutionPolicy Bypass -File "${pushScript}" -IntervalSeconds ${intervalSeconds} -MessagePrefix "${messagePrefix}"`;
+        autoPushTerminal.sendText(cmd, true);
+        autoPushEnabled = true;
+        statusState.autoPush.enabled = true;
+        statusState.autoPush.intervalSeconds = intervalSeconds;
+        statusState.autoPush.prefix = messagePrefix;
+        refreshSidebar();
+        watchAutoPushLog();
+        void tailAutoPushLog();
+        if (pushStatusBar) {
+            pushStatusBar.text = '$(cloud-upload) NF Push (Auto)';
+            pushStatusBar.tooltip = `Auto push every ${intervalSeconds}s`;
+        }
+        vscode.window.showInformationMessage('NeuroForge auto-push started.');
+    });
+
+    const stopAutoPushDisposable = vscode.commands.registerCommand('neuroforge.stopAutoPush', async () => {
+        if (!autoPushTerminal) {
+            vscode.window.showInformationMessage('NeuroForge auto-push is not running.');
+            return;
+        }
+        autoPushTerminal.dispose();
+        autoPushTerminal = null;
+        autoPushEnabled = false;
+        statusState.autoPush.enabled = false;
+        refreshSidebar();
+        if (autoPushLogWatcher) {
+            autoPushLogWatcher.dispose();
+            autoPushLogWatcher = null;
+        }
+        if (pushStatusBar) {
+            pushStatusBar.text = '$(cloud-upload) NF Push';
+            pushStatusBar.tooltip = 'Push changes to GitHub now';
+        }
+        vscode.window.showInformationMessage('NeuroForge auto-push stopped.');
+    });
+
+    const blastRadiusDisposable = vscode.commands.registerCommand('neuroforge.blastRadius', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a file to analyze blast radius.');
+            return;
+        }
+        const doc = editor.document;
+        if (doc.uri.scheme !== 'file') {
+            vscode.window.showWarningMessage('Blast radius is only available for files.');
+            return;
+        }
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(doc.uri);
+        if (!workspaceFolder) {
+            vscode.window.showWarningMessage('Open a workspace to analyze blast radius.');
+            return;
+        }
+
+        output.show(true);
+        output.appendLine(`\n--- Blast Radius Report ---`);
+        output.appendLine(`Target: ${doc.fileName}`);
+
+        const result = await computeBlastRadius(doc.uri);
+        const imports = result.imports.length ? result.imports : ['(none detected)'];
+        const importedBy = result.importedBy.length ? result.importedBy : ['(none detected)'];
+
+        output.appendLine('\nImports:');
+        for (const imp of imports) output.appendLine(`  - ${imp}`);
+
+        output.appendLine('\nImported By:');
+        for (const file of importedBy) output.appendLine(`  - ${file}`);
+
+        const count = result.importedBy.length;
+        const actions: string[] = [];
+        if (count > 0) actions.push('Show Importers');
+        if (result.imports.length > 0) actions.push('Show Imports');
+        const action = await vscode.window.showInformationMessage(
+            `Blast radius: ${count} file(s) import this file.`,
+            ...actions
+        );
+        if (action === 'Show Importers' && count > 0) {
+            const pick = await vscode.window.showQuickPick(
+                result.importedBy.map(file => ({
+                    label: path.basename(file),
+                    description: file
+                })),
+                { placeHolder: 'Open a file that imports this file' }
+            );
+            if (pick?.description) {
+                const docToOpen = await vscode.workspace.openTextDocument(pick.description);
+                await vscode.window.showTextDocument(docToOpen);
+            }
+        }
+        if (action === 'Show Imports' && result.imports.length > 0) {
+            const baseDir = path.dirname(doc.uri.fsPath);
+            const pick = await vscode.window.showQuickPick(
+                result.imports.map(spec => ({ label: spec })),
+                { placeHolder: 'Open an import from this file' }
+            );
+            if (pick?.label) {
+                const resolved = await resolveImportToFile(baseDir, pick.label);
+                if (resolved) {
+                    const docToOpen = await vscode.workspace.openTextDocument(resolved);
+                    await vscode.window.showTextDocument(docToOpen);
+                } else {
+                    vscode.window.showInformationMessage('Import could not be resolved to a file.');
+                }
+            }
+        }
+    });
+
+    const blastRadiusViewDisposable = vscode.commands.registerCommand('neuroforge.blastRadiusView', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a file to analyze blast radius.');
+            return;
+        }
+        const doc = editor.document;
+        if (doc.uri.scheme !== 'file') {
+            vscode.window.showWarningMessage('Blast radius is only available for files.');
+            return;
+        }
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(doc.uri);
+        if (!workspaceFolder) {
+            vscode.window.showWarningMessage('Open a workspace to analyze blast radius.');
+            return;
+        }
+
+        const panel = vscode.window.createWebviewPanel(
+            'neuroforgeBlastRadius',
+            'NeuroForge: Blast Radius',
+            vscode.ViewColumn.Beside,
+            { enableScripts: true }
+        );
+
+        const result = await computeBlastRadius(doc.uri);
+        panel.webview.html = getBlastRadiusHtml(doc.fileName, result.imports, result.importedBy);
+
+        panel.webview.onDidReceiveMessage(async (msg: any) => {
+            if (msg.command === 'openFile' && msg.file) {
+                const docToOpen = await vscode.workspace.openTextDocument(msg.file);
+                await vscode.window.showTextDocument(docToOpen);
+            }
+            if (msg.command === 'openImport' && msg.spec) {
+                const baseDir = path.dirname(doc.uri.fsPath);
+                const resolved = await resolveImportToFile(baseDir, msg.spec);
+                if (resolved) {
+                    const docToOpen = await vscode.workspace.openTextDocument(resolved);
+                    await vscode.window.showTextDocument(docToOpen);
+                } else {
+                    vscode.window.showInformationMessage('Import could not be resolved to a file.');
+                }
+            }
+        });
+    });
+
+    const blastRadiusCopyDisposable = vscode.commands.registerCommand('neuroforge.blastRadiusCopy', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a file to analyze blast radius.');
+            return;
+        }
+        const doc = editor.document;
+        if (doc.uri.scheme !== 'file') {
+            vscode.window.showWarningMessage('Blast radius is only available for files.');
+            return;
+        }
+
+        const result = await computeBlastRadius(doc.uri);
+        const imports = result.imports.length ? result.imports : ['(none detected)'];
+        const importedBy = result.importedBy.length ? result.importedBy : ['(none detected)'];
+        const lines = [
+            `Blast Radius Report`,
+            `Target: ${doc.fileName}`,
+            ``,
+            `Imports:`,
+            ...imports.map(i => `- ${i}`),
+            ``,
+            `Imported By:`,
+            ...importedBy.map(i => `- ${i}`)
+        ];
+        await vscode.env.clipboard.writeText(lines.join('\n'));
+        vscode.window.showInformationMessage('Blast radius report copied to clipboard.');
+    });
+
+    const contractDriftDisposable = vscode.commands.registerCommand('neuroforge.contractDrift', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a JSON file to analyze contract drift.');
+            return;
+        }
+        const doc = editor.document;
+        if (doc.languageId !== 'json') {
+            vscode.window.showWarningMessage('Contract drift requires a JSON file as the current schema.');
+            return;
+        }
+
+        const pick = await vscode.window.showOpenDialog({
+            title: 'Select previous schema JSON',
+            canSelectMany: false,
+            filters: { 'JSON': ['json'] }
+        });
+        if (!pick || pick.length === 0) return;
+
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
+
+        let currentSchema: any;
+        let previousSchema: any;
+        try {
+            currentSchema = JSON.parse(doc.getText());
+        } catch {
+            vscode.window.showErrorMessage('Current JSON is invalid.');
+            return;
+        }
+        try {
+            const prevBytes = await vscode.workspace.fs.readFile(pick[0]);
+            previousSchema = JSON.parse(Buffer.from(prevBytes).toString('utf8'));
+        } catch {
+            vscode.window.showErrorMessage('Previous JSON is invalid.');
+            return;
+        }
+
+        output.show(true);
+        output.appendLine('\n--- Contract Drift Report ---');
+        output.appendLine(`Current: ${doc.fileName}`);
+        output.appendLine(`Previous: ${pick[0].fsPath}`);
+
+        try {
+            const res = await fetchWithRetry(`${engineUrl}/contract/drift`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    current_schema: currentSchema,
+                    previous_schema: previousSchema
+                })
+            }, { timeoutMs: 8000, retries: 1 });
+
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data: any = await res.json();
+            const added = data.added || [];
+            const removed = data.removed || [];
+            const changed = data.changed || [];
+
+            output.appendLine(`Added: ${added.length}`);
+            added.forEach((p: string) => output.appendLine(`  + ${p}`));
+            output.appendLine(`Removed: ${removed.length}`);
+            removed.forEach((p: string) => output.appendLine(`  - ${p}`));
+            output.appendLine(`Changed: ${changed.length}`);
+            changed.forEach((p: string) => output.appendLine(`  ~ ${p}`));
+
+            vscode.window.showInformationMessage(`Contract drift: +${added.length} -${removed.length} ~${changed.length}`);
+        } catch (err) {
+            vscode.window.showErrorMessage(`Contract drift failed: ${toErrorMessage(err)}`);
+        }
+    });
+
+    const contractDriftPanelDisposable = vscode.commands.registerCommand('neuroforge.contractDriftPanel', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Open a JSON file to analyze contract drift.');
+            return;
+        }
+        const doc = editor.document;
+        if (doc.languageId !== 'json') {
+            vscode.window.showWarningMessage('Contract drift requires a JSON file as the current schema.');
+            return;
+        }
+
+        const pick = await vscode.window.showOpenDialog({
+            title: 'Select previous schema JSON',
+            canSelectMany: false,
+            filters: { 'JSON': ['json'] }
+        });
+        if (!pick || pick.length === 0) return;
+
+        const engineUrl = getAiEngineUrl();
+        const reachable = await ensureEngineReachable(engineUrl, output);
+        if (!reachable) return;
+
+        let currentSchema: any;
+        let previousSchema: any;
+        try {
+            currentSchema = JSON.parse(doc.getText());
+        } catch {
+            vscode.window.showErrorMessage('Current JSON is invalid.');
+            return;
+        }
+        try {
+            const prevBytes = await vscode.workspace.fs.readFile(pick[0]);
+            previousSchema = JSON.parse(Buffer.from(prevBytes).toString('utf8'));
+        } catch {
+            vscode.window.showErrorMessage('Previous JSON is invalid.');
+            return;
+        }
+
+        const panel = vscode.window.createWebviewPanel(
+            'neuroforgeContractDrift',
+            'NeuroForge: Contract Drift',
+            vscode.ViewColumn.Beside,
+            { enableScripts: true }
+        );
+
+        panel.webview.html = `
+            <body style="background:#0d1117;color:#e6edf3;font-family:-apple-system,'Segoe UI',sans-serif;padding:16px;">
+                <h2 style="color:#58a6ff;">Analyzing contract drift...</h2>
+            </body>
+        `;
+
+        try {
+            const res = await fetchWithRetry(`${engineUrl}/contract/drift`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    current_schema: currentSchema,
+                    previous_schema: previousSchema
+                })
+            }, { timeoutMs: 8000, retries: 1 });
+
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data: any = await res.json();
+            const added = data.added || [];
+            const removed = data.removed || [];
+            const changed = data.changed || [];
+
+            panel.webview.html = `
+                <body style="background:#0d1117;color:#e6edf3;font-family:-apple-system,'Segoe UI',sans-serif;padding:16px;">
+                    <h1 style="font-size:16px;color:#58a6ff;">Contract Drift</h1>
+                    <div style="color:#8b949e;font-size:12px;margin-bottom:12px;">
+                        Current: ${escapeHtml(doc.fileName)}<br/>
+                        Previous: ${escapeHtml(pick[0].fsPath)}
+                    </div>
+                    <h3 style="color:#8b949e;text-transform:uppercase;font-size:11px;letter-spacing:1px;">Added (${added.length})</h3>
+                    <pre style="background:#161b22;padding:8px;border-radius:6px;">${escapeHtml(added.join('\n') || '(none)')}</pre>
+                    <h3 style="color:#8b949e;text-transform:uppercase;font-size:11px;letter-spacing:1px;">Removed (${removed.length})</h3>
+                    <pre style="background:#161b22;padding:8px;border-radius:6px;">${escapeHtml(removed.join('\n') || '(none)')}</pre>
+                    <h3 style="color:#8b949e;text-transform:uppercase;font-size:11px;letter-spacing:1px;">Changed (${changed.length})</h3>
+                    <pre style="background:#161b22;padding:8px;border-radius:6px;">${escapeHtml(changed.join('\n') || '(none)')}</pre>
+                </body>
+            `;
+        } catch (err) {
+            panel.webview.html = `<body style="background:#0d1117;color:#e6edf3;padding:16px;">Contract drift failed: ${escapeHtml(toErrorMessage(err))}</body>`;
+        }
     });
 
     // --- Auto-Analyze on Save ---
@@ -779,7 +1652,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 editor.setDecorations(highSecurityDecoration, highRanges);
             }
 
-            sidebarProvider.updateView(data);
+            refreshSidebar(data);
             vscode.window.showInformationMessage(`NeuroForge: ${weaknesses.length} potential issues identified.`);
 
         } catch (err: any) {
@@ -923,6 +1796,32 @@ export async function activate(context: vscode.ExtensionContext) {
         output.show(true);
         vscode.window.showInformationMessage('NeuroForge logs are in the Output panel (channel: NeuroForge).');
     });
+
+    const intelligenceSuiteDisposable = vscode.commands.registerCommand('neuroforge.intelligenceSuite', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+        const engineUrl = getAiEngineUrl();
+        const panel = vscode.window.createWebviewPanel('neuroSuite', 'NeuroForge Suite', vscode.ViewColumn.One, { enableScripts: true });
+        panel.webview.html = '<h1>Loading Suite...</h1>';
+        try {
+            const res = await fetchWithRetry(`${engineUrl}/advisor/report`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: editor.document.getText(), language: editor.document.languageId }),
+            });
+            const data = await res.json();
+            panel.webview.html = getIntelligenceSuiteHtml(data);
+        } catch (e) {
+            panel.webview.html = `Error: ${e}`;
+        }
+    });
+
+    const launcherDisposable = vscode.commands.registerCommand('neuroforge.launcher', async () => {
+        const items = [{ label: 'Analyze File', command: 'neuroforge.analyzeFile' }, { label: 'Intelligence Suite', command: 'neuroforge.intelligenceSuite' }];
+        const pick = await vscode.window.showQuickPick(items);
+        if (pick) vscode.commands.executeCommand(pick.command);
+    });
+
 
     // --- COMMAND: Explain Code ---
     const explainDisposable = vscode.commands.registerCommand('neuroforge.explainCode', async () => {
@@ -1113,17 +2012,37 @@ export async function activate(context: vscode.ExtensionContext) {
                 'What security concerns do you see in this codebase?',
                 'How would you scale this code for 10x traffic?',
             ];
+            const telemetry = analysisData?.telemetry;
+            const telemetrySessionId: string | undefined = telemetry?.enabled ? telemetry.session_id : undefined;
+            const questionEvents: Array<{ id?: string; question?: string }> = Array.isArray(telemetry?.question_events)
+                ? telemetry.question_events
+                : [];
+            const questionEventIdsByIndex = questionEvents.map(ev => ev?.id);
 
             panel.webview.html = getInterviewHtml(questions);
 
             panel.webview.onDidReceiveMessage(async (msg: any) => {
                 if (msg.command === 'submitAnswer') {
-                    const { question, answer } = msg;
+                    const { question, answer, index } = msg;
+                    const payload: any = { question, answer };
+                    if (telemetrySessionId) {
+                        let questionEventId: string | undefined;
+                        if (typeof index === 'number' && index >= 0) {
+                            questionEventId = questionEventIdsByIndex[index];
+                        }
+                        if (!questionEventId && question) {
+                            questionEventId = questionEvents.find(ev => ev?.question === question)?.id;
+                        }
+                        if (questionEventId) {
+                            payload.session_id = telemetrySessionId;
+                            payload.question_event_id = questionEventId;
+                        }
+                    }
                     try {
                         const fbRes = await fetchWithRetry(`${engineUrl}/interview/feedback`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ question, answer }),
+                            body: JSON.stringify(payload),
                         }, { timeoutMs: 12000, retries: 1 });
                         const fb: any = await fbRes.json();
                         panel.webview.postMessage({ command: 'feedback', data: fb });
@@ -1418,10 +2337,21 @@ export async function activate(context: vscode.ExtensionContext) {
         fastRefactorDisposable,
         showLogsDisposable,
         startEngineDisposable,
+        setEngineUrlDisposable,
+        pushNowDisposable,
+        startAutoPushDisposable,
+        stopAutoPushDisposable,
+        blastRadiusDisposable,
+        blastRadiusViewDisposable,
+        blastRadiusCopyDisposable,
+        contractDriftDisposable,
+        contractDriftPanelDisposable,
+        configDisposable,
         codeActionProvider,
         vscode.languages.registerCodeLensProvider(['javascript', 'typescript', 'python'], lensProvider),
         analyzeBtn,
         engineStatusBar,
+        pushStatusBar,
         timeTrackerBar,
         typingDisposable,
         autoAnalyzeDisposable,
@@ -1430,7 +2360,9 @@ export async function activate(context: vscode.ExtensionContext) {
         heatmapDisposable,
         generateTestsDisposable,
         generateDocsDisposable,
-        autocompleteProvider
+        autocompleteProvider,
+        intelligenceSuiteDisposable,
+        launcherDisposable
     );
 
     context.subscriptions.push(
@@ -1439,6 +2371,63 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() { }
+
+function getIntelligenceSuiteHtml(data: any): string {
+    const review = data.review || {};
+    const findings = review.findings || [];
+    const performance = data.performance || {};
+    const hotspots = performance.hotspots || [];
+    const advice = data.advice || [];
+    const summary = review.summary || {};
+
+    const findingsHtml = findings.map((f: any) => `
+        <div class="finding-card ${f.severity}">
+            <div class="f-header">
+                <span class="f-cat">${f.category}</span>
+                <span class="f-sev">${f.severity}</span>
+                <span class="f-line">Line ${f.line}</span>
+            </div>
+            <div class="f-label">${f.label}</div>
+            <div class="f-snippet"><code>${f.snippet}</code></div>
+            <div class="f-hint"><b>Fix Action:</b> ${f.hint}</div>
+        </div>
+    `).join('');
+
+    const hotspotsHtml = hotspots.map((h: any) => `
+        <div class="perf-row">
+            <div class="p-type ${h.type.toLowerCase()}">${h.type}</div>
+            <div class="p-info">
+                <div class="p-reason">Line ${h.line}: ${h.reason}</div>
+                <div class="p-intensity">Intensity: ${h.intensity}</div>
+            </div>
+        </div>
+    `).join('');
+
+    const adviceHtml = advice.map((a: string) => `<li>${a}</li>`).join('');
+
+    return `
+        <!DOCTYPE html><html><head>
+        <style>
+            body { background: #010409; color: #e6edf3; font-family: -apple-system, sans-serif; padding: 24px; }
+            .finding-card { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px; border-left: 4px solid #30363d; }
+            .finding-card.critical { border-left-color: #f85149; }
+            .finding-card.high { border-left-color: #f85149; }
+            .f-label { font-size: 15px; font-weight: 600; }
+            .f-snippet { background: #161b22; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 12px; }
+            .perf-row { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; margin-bottom: 8px; display: flex; gap: 12px; }
+            .p-type { font-size: 9px; font-weight: 800; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+            .p-type.cpu { background: rgba(188, 140, 255, 0.15); color: #bc8cff; }
+        </style>
+        </head><body>
+            <h1>Neural Intelligence Suite</h1>
+            ${findingsHtml || '<p>No issues detected.</p>'}
+            ${hotspotsHtml}
+            <ul>${adviceHtml}</ul>
+        </body></html>
+    `;
+}
+
+
 
 
 

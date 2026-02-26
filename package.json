@@ -14,7 +14,22 @@
   "activationEvents": [
     "onLanguage:javascript",
     "onLanguage:typescript",
-    "onLanguage:python"
+    "onLanguage:python",
+    "onCommand:neuroforge.blastRadius",
+    "onCommand:neuroforge.blastRadiusView",
+    "onCommand:neuroforge.blastRadiusCopy",
+    "onCommand:neuroforge.contractDrift",
+    "onCommand:neuroforge.contractDriftPanel",
+    "onCommand:neuroforge.mergePredict",
+    "onCommand:neuroforge.mergePredictPanel",
+    "onCommand:neuroforge.launcher",
+    "onCommand:neuroforge.intelligenceSuite",
+    "onCommand:neuroforge.pushNow",
+    "onCommand:neuroforge.startAutoPush",
+    "onCommand:neuroforge.stopAutoPush",
+    "onCommand:neuroforge.showAutoPushLog",
+    "onCommand:neuroforge.startEngine",
+    "onCommand:neuroforge.setEngineUrl"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -78,6 +93,62 @@
       {
         "command": "neuroforge.startEngine",
         "title": "NeuroForge: Start AI Engine"
+      },
+      {
+        "command": "neuroforge.setEngineUrl",
+        "title": "NeuroForge: Set AI Engine URL"
+      },
+      {
+        "command": "neuroforge.pushNow",
+        "title": "NeuroForge: Push Changes Now"
+      },
+      {
+        "command": "neuroforge.startAutoPush",
+        "title": "NeuroForge: Start Auto Push"
+      },
+      {
+        "command": "neuroforge.stopAutoPush",
+        "title": "NeuroForge: Stop Auto Push"
+      },
+      {
+        "command": "neuroforge.blastRadius",
+        "title": "NeuroForge: BlastRadius (Blast Radius)"
+      },
+      {
+        "command": "neuroforge.blastRadiusView",
+        "title": "NeuroForge: BlastRadius (Panel)"
+      },
+      {
+        "command": "neuroforge.blastRadiusCopy",
+        "title": "NeuroForge: Copy Blast Radius Report"
+      },
+      {
+        "command": "neuroforge.contractDrift",
+        "title": "NeuroForge: Contract Drift Monitor"
+      },
+      {
+        "command": "neuroforge.contractDriftPanel",
+        "title": "NeuroForge: Contract Drift (Panel)"
+      },
+      {
+        "command": "neuroforge.mergePredict",
+        "title": "NeuroForge: Merge Conflict Predictor"
+      },
+      {
+        "command": "neuroforge.mergePredictPanel",
+        "title": "NeuroForge: Merge Conflict Predictor (Panel)"
+      },
+      {
+        "command": "neuroforge.launcher",
+        "title": "NeuroForge: Quick Actions"
+      },
+      {
+        "command": "neuroforge.showAutoPushLog",
+        "title": "NeuroForge: Show Auto Push Log"
+      },
+      {
+        "command": "neuroforge.intelligenceSuite",
+        "title": "NeuroForge: Intelligence Suite"
       }
     ],
     "menus": {
@@ -104,6 +175,46 @@
         },
         {
           "command": "neuroforge.generateDocs",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.blastRadius",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.blastRadiusView",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.blastRadiusCopy",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.contractDrift",
+          "group": "navigation",
+          "when": "editorTextFocus && editorLangId == json"
+        },
+        {
+          "command": "neuroforge.contractDriftPanel",
+          "group": "navigation",
+          "when": "editorTextFocus && editorLangId == json"
+        },
+        {
+          "command": "neuroforge.mergePredict",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.mergePredictPanel",
+          "group": "navigation",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "neuroforge.intelligenceSuite",
           "group": "navigation",
           "when": "editorTextFocus"
         }
@@ -146,6 +257,24 @@
           "type": "string",
           "default": "",
           "description": "Optional path to a coverage JSON file (e.g., coverage-final.json)."
+        },
+        "neuroforge.autoPushRepos": {
+          "type": "array",
+          "default": [
+            "ai-engine",
+            "vscode-extension"
+          ],
+          "description": "Repositories to include when running NeuroForge: Push Changes Now."
+        },
+        "neuroforge.autoPushMessagePrefix": {
+          "type": "string",
+          "default": "AI message",
+          "description": "Commit message prefix used by NeuroForge: Push Changes Now."
+        },
+        "neuroforge.autoPushIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "Interval (in seconds) for NeuroForge auto-push."
         }
       }
     }
